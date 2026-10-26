@@ -1,0 +1,165 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <meta name="theme-color" media="(prefers-color-scheme: light)" content="#f7f7f9" />
+    <meta name="theme-color" media="(prefers-color-scheme: dark)" content="#1f1f1f" />
+    <title>Dimina DevTools — 小程序开发者工具</title>
+    <meta name="description" content="调试 Dimina 小程序的桌面工具。也可以把编译、H5 预览和 Electron 运行时装进自己的程序。" />
+    <meta property="og:title" content="Dimina DevTools — 小程序开发者工具" />
+    <meta property="og:description" content="模拟器、编辑器，以及 WXML、AppData、Storage、Console 和编译面板。" />
+    <meta property="og:type" content="website" />
+    <meta property="og:url" content="https://lbb00.github.io/dimina-studio/" />
+    <meta property="og:image" content="https://lbb00.github.io/dimina-studio/devtools.png" />
+    <link rel="stylesheet" href="./styles.css" />
+    <script src="./downloads.js" defer></script>
+    <script src="./showcase-theme.js" defer></script>
+  </head>
+  <body>
+    <header class="site-header">
+      <a class="brand" href="./" aria-label="Dimina Studio 首页">
+        <span>Dimina Studio</span>
+      </a>
+      <nav aria-label="主导航">
+        <a href="#features">功能</a>
+        <a href="#download">下载</a>
+        <a href="https://github.com/lbb00/dimina-studio">GitHub</a>
+      </nav>
+    </header>
+
+    <main>
+      <section class="hero">
+        <div class="hero-copy">
+          <p class="eyebrow">配合 <a href="https://github.com/didi/dimina">Dimina</a> 使用</p>
+          <h1>调试 Dimina<br />小程序</h1>
+          <p class="lead">桌面工具里有模拟器、编辑器和调试面板。编译、H5 预览和 Electron 运行时也可以单独安装。</p>
+          <div class="actions">
+            <a class="button button-primary" href="#download">下载 DevTools</a>
+            <a class="button button-secondary" href="https://github.com/lbb00/dimina-studio#readme">查看开发文档</a>
+          </div>
+          <p class="platforms">支持 macOS · Windows · Linux</p>
+        </div>
+
+        <figure class="product-shot">
+          <div class="product-shot-controls" role="group" aria-label="效果图主题">
+            <button type="button" data-shot-theme="system" aria-pressed="true">跟随系统</button>
+            <button type="button" data-shot-theme="light" aria-pressed="false">浅色</button>
+            <button type="button" data-shot-theme="dark" aria-pressed="false">深色</button>
+          </div>
+          <picture data-product-shot>
+            <source media="(prefers-color-scheme: dark)" srcset="./devtools-dark.png" />
+            <img src="./devtools.png" width="2880" height="1672" alt="Dimina DevTools 工作台，左侧为小程序模拟器，右侧为开发者工具" />
+          </picture>
+        </figure>
+      </section>
+
+      <section class="section" id="features">
+        <div class="section-heading">
+          <p class="eyebrow">桌面工具</p>
+          <h2>编辑、预览和调试在同一个窗口</h2>
+          <p>WXML、AppData、Storage、Console 和编译面板跟模拟器放在一起。</p>
+        </div>
+        <div class="feature-grid">
+          <article class="feature-card feature-card-wide">
+            <span class="feature-index">01</span>
+            <h3>编辑器与模拟器</h3>
+            <p>内嵌编辑器改代码，旁边的模拟器看结果。保存样式时尽量热更新；保存脚本或模板后，模拟器会重新启动。</p>
+          </article>
+          <article class="feature-card">
+            <span class="feature-index">02</span>
+            <h3>调试面板</h3>
+            <p>可以接上 Chrome DevTools，也有 WXML、AppData、Storage、Console 和编译面板。AppData 改完可以写回。</p>
+          </article>
+          <article class="feature-card">
+            <span class="feature-index">03</span>
+            <h3>设备外观</h3>
+            <p>切换手机和平板，检查安全区、状态栏和挖孔对页面布局的影响。</p>
+          </article>
+          <article class="feature-card feature-card-dark">
+            <span class="feature-index">04</span>
+            <h3>可以分开安装</h3>
+            <p>compiler、devkit 和 electron-runtime 不依赖桌面工具，可以装进自己的程序。</p>
+            <a href="https://github.com/lbb00/dimina-studio#%E5%8C%85%E4%B8%80%E8%A7%88">查看所有开发包 <span aria-hidden="true">→</span></a>
+          </article>
+        </div>
+      </section>
+
+      <section class="section download-section" id="download">
+        <div class="section-heading section-heading-centered">
+          <p class="eyebrow">正式版 · <span data-release-version>Dimina DevTools 0.4.0</span></p>
+          <h2>下载</h2>
+          <p>下面是当前正式版。其他版本和更新说明在 GitHub Releases。</p>
+        </div>
+        <div class="download-grid">
+          <a class="download-card" data-asset-suffix="-mac-arm64.dmg" href="https://github.com/lbb00/dimina-studio/releases/download/release-20260728-6/dimina-devtools-0.4.0-mac-arm64.dmg">
+            <span class="download-platform">macOS</span>
+            <strong>Apple Silicon</strong>
+            <span>下载 .dmg <b aria-hidden="true">↓</b></span>
+          </a>
+          <a class="download-card" data-asset-suffix="-mac-x64.dmg" href="https://github.com/lbb00/dimina-studio/releases/download/release-20260728-6/dimina-devtools-0.4.0-mac-x64.dmg">
+            <span class="download-platform">macOS</span>
+            <strong>Intel</strong>
+            <span>下载 .dmg <b aria-hidden="true">↓</b></span>
+          </a>
+          <a class="download-card" data-asset-suffix="-win-x64.zip" href="https://github.com/lbb00/dimina-studio/releases/download/release-20260728-6/dimina-devtools-0.4.0-win-x64.zip">
+            <span class="download-platform">Windows</span>
+            <strong>x64</strong>
+            <span>下载 .zip <b aria-hidden="true">↓</b></span>
+          </a>
+          <a class="download-card" data-asset-suffix="-linux-x64.tar.gz" href="https://github.com/lbb00/dimina-studio/releases/download/release-20260728-6/dimina-devtools-0.4.0-linux-x64.tar.gz">
+            <span class="download-platform">Linux</span>
+            <strong>x64</strong>
+            <span>下载 .tar.gz <b aria-hidden="true">↓</b></span>
+          </a>
+        </div>
+        <a class="release-link" href="https://github.com/lbb00/dimina-studio/releases/latest">查看全部版本与更新记录 <span aria-hidden="true">→</span></a>
+        <aside class="dev-download" aria-labelledby="dev-download-title">
+          <div>
+            <p class="eyebrow">Dev 版</p>
+            <h3 id="dev-download-title">试用最新开发构建</h3>
+            <p>开发构建可能不稳定，下载前需要登录 GitHub。打开工作流，选一次成功的 main 或 dev 运行，在 Artifacts 里按平台下载。工件保留 30 天。</p>
+          </div>
+          <a class="button button-secondary" href="https://github.com/lbb00/dimina-studio/actions/workflows/release.yml">查看开发构建 <span aria-hidden="true">→</span></a>
+        </aside>
+        <p class="sr-only" data-release-status aria-live="polite"></p>
+      </section>
+
+      <section class="section developer-section">
+        <div>
+          <p class="eyebrow">Node.js</p>
+          <h2>只编译和预览</h2>
+          <p>安装 <code>@dimina-studio/devkit</code>，用返回的端口打开预览。</p>
+        </div>
+        <div class="code-card">
+          <div class="code-card-header"><span></span><span></span><span></span></div>
+          <pre><code>import { openProject } from '@dimina-studio/devkit'
+
+const session = await openProject({
+  projectPath: '/path/to/miniapp',
+  port: 0,
+})
+console.log(session.port)</code></pre>
+          <a href="https://github.com/lbb00/dimina-studio#%E5%B5%8C%E5%85%A5%E5%BC%80%E5%8F%91%E5%8C%85">阅读接入文档 <span aria-hidden="true">→</span></a>
+        </div>
+      </section>
+    </main>
+
+    <footer>
+      <div class="footer-inner">
+        <div>
+          <a class="brand" href="./"><span>Dimina Studio</span></a>
+          <p>Dimina 小程序的开发工具。</p>
+        </div>
+        <div class="footer-links">
+          <a href="https://github.com/lbb00/dimina-studio">GitHub</a>
+          <a href="https://github.com/lbb00/dimina-studio/issues">Issues</a>
+          <a href="https://github.com/lbb00/dimina-studio/blob/main/CONTRIBUTING.md">参与贡献</a>
+          <a href="https://github.com/lbb00/dimina-studio/blob/main/CODE_OF_CONDUCT.md">行为准则</a>
+          <a href="https://github.com/lbb00/dimina-studio/blob/main/SECURITY.md">安全</a>
+          <a href="https://github.com/lbb00/dimina-studio/blob/main/LICENSE">MIT License</a>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>

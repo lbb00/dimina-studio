@@ -1,0 +1,320 @@
+import esbuild from 'esbuild'
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import { createRequire } from 'node:module'
+import path from 'node:path'
+import { COMPILER_BROWSER_ASSETS, browserOutputsFromMetafile, checkAssetsAgainstExports, checkBrowserAssetContract } from '../src/browser-assets.js'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const root = path.resolve(__dirname, '..')
+const shim = (f) => path.join(root, 'src/shims', f)
+
+// The dart-sass package lives in dimina-studio's `dimina` submodule fe workspace.
+// Resolve it from there (instead of a machine-specific absolute path) and force
+// its pure-JS browser entry (`sass.default.js`) — NOT the node launcher.
+const kitFeRequire = createRequire(path.resolve(root, '../../dimina/fe/package.json'))
+const sassBrowserEntry = path.join(path.dirname(kitFeRequire.resolve('sass')), 'sass.default.js')
+
+// Resolve autoprefixer from the node bundle location so the browser bundle and
+// node reference use the same CSS transformation rules.
+const nodeRuntimeRequire = createRequire(path.join(root, 'dist/compile-core.node.js'))
+const autoprefixerEntry = nodeRuntimeRequire.resolve('autoprefixer')
+
+// mode "node"    -> Layer1: validate orchestration in Node, native esbuild/oxc kept external
+// mode "browser" -> bundle everything for the browser (pure-JS + wasm toolchain)
+// Passed as argv (cross-platform; `MODE=x node ...` breaks on Windows cmd), env MODE kept as fallback.
+const MODE = process.argv[2] || process.env.MODE || 'node'
+const USE_WASM = process.env.USE_WASM === '1' || MODE === 'browser'
+
+// Append exports for functions/reset-hooks the compiler defines but does not
+// export, without touching the submodule source on disk. The reset hooks clear
+// the compiler's module-level caches so a pooled worker realm can compile more
+// than once without cross-compile contamination (see resetCompilerState).
+const exportAppend = {
+  name: 'export-append',
+  setup(build) {
+    const appends = {
+      // `sourcemapTargetPath` is dmcc's own worker-message state (set from
+      // `sourcemapTargetPath: targetPath` in the message that spawns a build) —
+      // this driver never sends that message, so writeCompileRes's sourcemap
+      // branch would dereference it as null. The driver (pool-node.js's runAttempt)
+      // now threads the caller-known FINAL output dir through runStage's own opts;
+      // `targetPath` here is that value. Falling back to getTargetPath() (the
+      // staging dir) when no explicit value is given mirrors dmcc's own
+      // `targetPath || getTargetPath()`, and runs on every enable/disable — sourcemap
+      // off always clears it to null — so it can never carry over stale state from a
+      // prior build sharing this pooled realm.
+      'logic-compiler.js': '\nexport { writeCompileRes }\nexport function __resetLogicState() { processedModules.clear() }\nexport function __setEnableSourcemap(v, targetPath) { enableSourcemap = !!v; sourcemapTargetPath = enableSourcemap ? (targetPath || getTargetPath()) : null }\n',
+      // loadSass is otherwise only reachable through the `.scss`/`.sass` branch inside
+      // compileSS — a style compile with no such file never calls it. Exposing it lets
+      // compile-core.js's preloadStage warm dart-sass at worker spawn time, by stage
+      // identity alone, instead of waiting for a matching file to show up.
+      'style-compiler.js': '\nexport function __resetStyleState() { compileRes.clear() }\nexport function __preloadStyleToolchain() { return loadSass() }\n',
+      // templateRenderCache/optionalChainingCache are dmcc's own view-compile
+      // perf caches (named-template render output, optional-chaining rewrites);
+      // dmcc's own worker-message handler clears them alongside the older
+      // caches at end-of-task, but this driver calls compileML directly and
+      // never goes through that handler, so they must be cleared here too or
+      // a pooled worker realm leaks them across unrelated builds indefinitely.
+      'view-compiler.js': '\nexport function __resetViewState() { compileResCache.clear(); wxsModuleRegistry.clear(); wxsFilePathMap.clear(); templateRenderCache.clear(); optionalChainingCache.clear() }\nexport function __setEnableSourcemap(v) { enableSourcemap = !!v }\n',
+      'utils.js': '\nexport function __resetAssets() { for (const k of Object.keys(assetsMap)) delete assetsMap[k] }\n',
+    }
+    build.onLoad({ filter: /(core[\\/](logic|style|view)-compiler|common[\\/]utils)\.js$/ }, async (args) => {
+      const base = path.basename(args.path)
+      const src = await readFile(args.path, 'utf8')
+      return { contents: src + (appends[base] || ''), loader: 'js' }
+    })
+  },
+}
+
+// In node mode, keep heavy/native deps external (resolved at runtime via NODE_PATH).
+// Isolate the oxc swap: in node mode, optionally replace native oxc with wasm
+// while keeping native esbuild (so any failure is attributable to oxc only).
+const USE_OXC_WASM = process.env.USE_OXC_WASM === '1'
+
+// The upstream compiler imports `oxc-parser` directly in several modules. In
+// native builds route every one of those imports through the checked shim while
+// leaving the shim's own import external, so it reaches the installed parser
+// rather than resolving back into itself.
+const nativeOxcDiagnostics = {
+  name: 'native-oxc-diagnostics',
+  setup(build) {
+    const nativeShim = shim('oxc-parser-native.js')
+    build.onResolve({ filter: /^oxc-parser$/ }, (args) => {
+      if (path.normalize(args.importer) === path.normalize(nativeShim)) {
+        return { path: 'oxc-parser', external: true }
+      }
+      return { path: nativeShim }
+    })
+  },
+}
+
+// Keep the CSS pipeline external in the node build: inlining browserslist entangles
+// its config lookup with the compiler's INJECTED fs (browserslist would walk the
+// memfs project tree instead of the real disk). External keeps browserslist on the
+// real node fs, matching the reference compiler.
+const NODE_EXTERNAL = [
+  'esbuild', 'sass', 'less', 'postcss',
+  'autoprefixer', 'cssnano', 'cheerio', 'htmlparser2', '@vue/compiler-sfc',
+  'magic-string', 'source-map-js', 'postcss-selector-parser',
+  ...(USE_OXC_WASM ? ['@oxc-parser/wasm'] : ['oxc-parser', 'oxc-walker']),
+]
+
+const common = {
+  entryPoints: [path.join(root, 'src/compile-core.js')],
+  bundle: true,
+  format: 'esm',
+  target: ['es2022'],
+  plugins: [exportAppend],
+  logLevel: 'info',
+}
+
+if (MODE === 'node' && !USE_OXC_WASM) common.plugins.push(nativeOxcDiagnostics)
+
+const oxcWasmAlias = USE_OXC_WASM
+  ? { 'oxc-parser': shim('oxc-parser.js'), 'oxc-walker': shim('oxc-walker.js') }
+  : {}
+
+// compile-core.node.js: the injectable in-memory seam — fs is SHIMMED so the caller
+// passes a node:fs replacement (memfs). worker_threads is shimmed (isMainThread=true)
+// to skip dmcc's parentPort bootstrap since we drive the exports inline.
+const nodeShimAlias = {
+  'node:fs': shim('fs.js'),
+  'fs': shim('fs.js'),
+  'node:worker_threads': shim('worker_threads.js'),
+  ...oxcWasmAlias,
+}
+
+// pool.node.js / stage-worker.node.js: the resident Node disk pool. fs is NATIVE
+// (dmcc writes real disk staging, then publishToDist copies to outputDir) — do NOT
+// alias it. worker_threads is STILL shimmed so dmcc's own `if(!isMainThread)` parentPort
+// bootstrap stays OFF (otherwise its handler would race ours on the same port); the pool
+// and stage worker reach the REAL Worker/parentPort via createRequire (bypasses this alias).
+const nodeNativeAlias = {
+  'node:worker_threads': shim('worker_threads.js'),
+  ...oxcWasmAlias,
+}
+
+let opts
+if (MODE === 'node') {
+  opts = {
+    ...common,
+    platform: 'node',
+    external: NODE_EXTERNAL,
+  }
+} else {
+  const alias = {
+    'node:fs': shim('fs.js'),
+    'fs': shim('fs.js'),
+    'node:fs/promises': shim('fs-promises.js'),
+    'fs/promises': shim('fs-promises.js'),
+    'node:os': shim('os.js'),
+    'os': shim('os.js'),
+    'node:process': shim('process.js'),
+    'process': shim('process.js'),
+    'node:url': shim('url.js'),
+    'url': shim('url.js'),
+    'node:worker_threads': shim('worker_threads.js'),
+    'node:crypto': shim('crypto.js'),
+    'crypto': shim('crypto.js'),
+    'node:async_hooks': shim('async_hooks.js'),
+    'async_hooks': shim('async_hooks.js'),
+    // cssnano 9.x uses createRequire(import.meta.url) to dynamically load a
+    // user-supplied preset/plugin/configFile by string; kit's fixed cssnano()
+    // call never exercises that path (see src/shims/module.js).
+    'node:module': shim('module.js'),
+    'module': shim('module.js'),
+    'node:path': 'path-browserify',
+    'path': 'path-browserify',
+    'node:events': 'events',
+    'node:buffer': 'buffer',
+    'node:stream': 'stream-browserify',
+    'stream': 'stream-browserify',
+    'node:util': 'util',
+    'node:assert': 'assert',
+    'less': shim('less.js'),
+    // force the pure-JS (browser) sass entry, not the node launcher
+    'sass': sassBrowserEntry,
+    // force esbuild-wasm's browser ESM build (not the node build)
+    'esbuild-wasm': path.join(root, 'node_modules/esbuild-wasm/esm/browser.js'),
+  }
+  // CSS pipeline: by default bundle the REAL autoprefixer + cssnano (same versions
+  // as the node/dmcc build) so the browser CSS output is byte-identical to dmcc.
+  // They pull browserslist + caniuse-lite, which only need process.env (already in
+  // the banner) since the compiler passes overrideBrowserslist and skips config
+  // lookup. Set REAL_CSS=0 to fall back to the old no-op shims (CSS left un-minified).
+  if (process.env.REAL_CSS === '0') {
+    alias['autoprefixer'] = shim('postcss-noop-plugin.js')
+    alias['cssnano'] = shim('postcss-noop-plugin.js')
+  } else {
+    // pin autoprefixer to the node/dmcc-resolved copy (see above)
+    alias['autoprefixer'] = autoprefixerEntry
+  }
+  if (USE_WASM) {
+    alias['esbuild'] = shim('esbuild-wasm.js')
+    alias['oxc-parser'] = shim('oxc-parser.js')
+    alias['oxc-walker'] = shim('oxc-walker.js')
+  }
+  opts = {
+    ...common,
+    platform: 'browser',
+    format: 'esm',
+    alias,
+    define: {
+      'process.env.NODE_ENV': '"production"',
+      // some postcss plugins reference __filename/__dirname for source locations;
+      // esbuild's browser platform leaves them undefined, so provide stable stubs.
+      '__filename': '"/index.js"',
+      '__dirname': '"/"',
+    },
+    // Tiny process shim — env + cwd only. NO process.versions.node, so dart-sass,
+    // esbuild-wasm and the Go wasm runtime still detect a browser env; cwd is needed
+    // by browserslist (real autoprefixer/cssnano) and is safe to expose.
+    banner: {
+      js: [
+        'globalThis.global ||= globalThis;',
+        'globalThis.process ||= { env: {}, cwd: () => "/" };',
+        'globalThis.process.cwd ||= () => "/";',
+      ].join('\n'),
+    },
+  }
+}
+
+// Node mode builds with esbuild `splitting`: compile-core.js loads the three stage
+// compilers via dynamic import (lazy per-stage toolchains), and only code-splitting
+// keeps that lazy at runtime — a single-file bundle would hoist each stage's external
+// heavy imports (`import 'sass'`, …) back to the entry's top level, silently loading
+// every toolchain in every realm again. Each build gets its own chunk dir because the
+// two builds alias fs differently (shimmed vs native): same source, different chunks.
+//
+// Browser mode ships single-file bundles from the same config: the core seams
+// (compile-core.browser.js), the package's resident stage worker
+// (stage-worker.browser.js, bundles the compiler + memfs), and the light-weight
+// orchestrated pool (pool.browser.js). No splitting needed there: everything is
+// bundled (no externals to hoist), and esbuild inlines the dynamic imports as
+// deferred `__esm` initializers — module init still runs on first use.
+const builds = MODE === 'node'
+  ? [
+      {
+        entries: [{ in: 'src/compile-core.js', out: 'compile-core.node' }],
+        alias: nodeShimAlias,
+        chunkDir: 'compile-core.node-chunks',
+      },
+      // Resident Node worker_threads disk pool (real fs, dmcc-parity output + sourcemap).
+      {
+        entries: [
+          { in: 'src/pool-node.js', out: 'pool.node' },
+          { in: 'src/stage-worker-node.js', out: 'stage-worker.node' },
+        ],
+        alias: nodeNativeAlias,
+        chunkDir: 'pool.node-chunks',
+      },
+    ]
+  : [
+      { entries: [{ in: 'src/browser-entry.js', out: 'compile-core.browser' }] },
+      { entries: [{ in: 'src/stage-worker.js', out: 'stage-worker.browser' }] },
+      { entries: [{ in: 'src/pool.js', out: 'pool.browser' }] },
+      { entries: [{ in: 'src/toolchain.js', out: 'toolchain.browser' }] },
+    ]
+
+const { rm } = await import('node:fs/promises')
+const browserMetafileOutputs = {}
+for (const b of builds) {
+  const built = {
+    ...opts,
+    entryPoints: b.entries.map((e) => ({ in: path.join(root, e.in), out: e.out })),
+    outdir: path.join(root, 'dist'),
+    ...(b.alias ? { alias: b.alias } : {}),
+    ...(b.chunkDir
+      ? { splitting: true, chunkNames: `${b.chunkDir}/[name]-[hash]` }
+      : {}),
+    // Browser mode: the metafile is what the static-asset contract is checked
+    // against below — esbuild's own record of what it emitted and what each
+    // output still imports, rather than a re-scan of the bytes.
+    ...(MODE === 'browser' ? { metafile: true } : {}),
+  }
+  // Chunk names embed content hashes; stale ones from earlier builds would pile up in
+  // dist (and ship in the npm package), so each build owns and clears its chunk dir.
+  if (b.chunkDir) await rm(path.join(root, 'dist', b.chunkDir), { recursive: true, force: true })
+  const result = await esbuild.build(built)
+  if (result.metafile) Object.assign(browserMetafileOutputs, result.metafile.outputs)
+  console.log(`✅ built MODE=${MODE} USE_WASM=${USE_WASM ? 1 : 0} -> ${b.entries.map((e) => `dist/${e.out}.js`).join(', ')}`)
+}
+
+// The static-asset manifest itself: dependency-free string code, emitted in both
+// modes (either build alone leaves a usable dist) and in both formats, because the
+// hosts that copy these files are as often CommonJS build scripts as ESM ones.
+// src/file-types.js（方言扩展名）走同一条路：宿主的编辑器配置和文件分类也常常在 CJS 里。
+for (const name of ['browser-assets', 'file-types']) {
+  for (const [format, ext] of [['esm', 'js'], ['cjs', 'cjs']]) {
+    await esbuild.build({
+      entryPoints: [path.join(root, `src/${name}.js`)],
+      outfile: path.join(root, 'dist', `${name}.${ext}`),
+      bundle: true,
+      format,
+      target: ['es2022'],
+      logLevel: 'warning',
+    })
+  }
+  console.log(`✅ built dist/${name}.js + dist/${name}.cjs`)
+}
+
+// The browser bundles double as static files a host copies and serves. Their names
+// and the "self-contained, imports nothing" rule are stated once in
+// src/browser-assets.js, and enforced here so a rename or a newly split chunk fails
+// the build instead of 404-ing (or half-loading) inside a host months later.
+if (MODE === 'browser') {
+  // esbuild keys the metafile by paths relative to the working directory, so the
+  // asset check sees the same `dist/…` prefix a host would copy from — and an
+  // output that lands in a subdirectory keeps that subdirectory in its name.
+  const outdirPrefix = `${path.relative(process.cwd(), path.join(root, 'dist')).split(path.sep).join('/')}/`
+  const problems = [
+    ...checkBrowserAssetContract(browserOutputsFromMetafile({ outputs: browserMetafileOutputs }, outdirPrefix)),
+    ...checkAssetsAgainstExports(JSON.parse(await readFile(path.join(root, 'package.json'), 'utf8')).exports),
+  ]
+  if (problems.length > 0) {
+    console.error(problems.map((line) => `  ✗ ${line}`).join('\n'))
+    process.exit(1)
+  }
+  console.log(`✅ browser static-asset contract holds (${COMPILER_BROWSER_ASSETS.length} assets, self-contained, names match the exports map)`)
+}

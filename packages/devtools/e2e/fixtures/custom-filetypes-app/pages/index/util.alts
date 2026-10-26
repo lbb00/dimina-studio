@@ -1,0 +1,6 @@
+// view-script module — the editor classifies .alts as javascript via fileTypes
+module.exports = {
+  upper: function (s) {
+    return s.toUpperCase()
+  },
+}

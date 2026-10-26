@@ -1,0 +1,476 @@
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      channel:
+        description: 'Channel — dev: normalized x.y.z-dev.<timestamp> versions, npm dist-tag dev, no GitHub Release. release: stable package.json versions, npm dist-tag latest, time-named GitHub Release with diff-based notes.'
+        type: choice
+        options:
+          - dev
+          - release
+        default: dev
+
+permissions:
+  contents: write
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    outputs:
+      release_name: ${{ steps.compute.outputs.release_name }}
+      npm_tag: ${{ steps.compute.outputs.npm_tag }}
+      dev_version_suffix: ${{ steps.compute.outputs.dev_version_suffix }}
+      last_release_tag: ${{ steps.compute.outputs.last_release_tag }}
+    steps:
+      - id: compute
+        shell: bash
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ "$CHANNEL" == "dev" ]]; then
+            ts="$(date -u +%Y%m%d%H%M%S)"
+            dev_version_suffix="dev.${ts}"
+            # Only main may move the shared `dev` dist-tag; other refs publish
+            # to an isolated `dev-<branch>` tag so a branch dispatch can never
+            # repoint what consumers install via @dev.
+            if [[ "$REF_NAME" == "main" ]]; then
+              npm_tag="dev"
+            else
+              npm_tag="dev-$(printf '%s' "$REF_NAME" | tr '[:upper:]' '[:lower:]' | sed 's/[^a-z0-9._-]/-/g')"
+            fi
+            release_name=""
+            last_release_tag=""
+          else
+            dev_version_suffix=""
+            npm_tag="latest"
+            date_part="$(date -u +%Y%m%d)"
+            last_release_tag=$(gh release list --repo "$REPO" --limit 1 --json tagName \
+              --jq '.[0].tagName // ""')
+            last_count="${last_release_tag##*-}"
+            if [[ "$last_count" =~ ^[0-9]+$ ]]; then
+              next=$((last_count + 1))
+            else
+              next=1
+            fi
+            release_name="release-${date_part}-${next}"
+          fi
+          {
+            echo "dev_version_suffix=$dev_version_suffix"
+            echo "npm_tag=$npm_tag"
+            echo "release_name=$release_name"
+            echo "last_release_tag=$last_release_tag"
+          } >> "$GITHUB_OUTPUT"
+
+  build-clients:
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+          - os: macos-latest
+            platform: mac
+            arch: arm64
+          # macos-13 (Intel) is deprecated; macos-15-intel is the last x86_64
+          # image GitHub Actions will host (through Aug 2027).
+          - os: macos-15-intel
+            platform: mac
+            arch: x64
+          - os: windows-latest
+            platform: win
+            arch: x64
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      # electron-builder reads ELECTRON_BUILDER_CACHE for 7zip / app-builder-bin
+      # downloads. @electron/get (invoked by electron's postinstall) does NOT
+      # honour any env var — it downloads into the fixed per-OS path we cache
+      # below in "Cache Electron binaries".
+      ELECTRON_BUILDER_CACHE: ${{ github.workspace }}/.cache/electron-builder
+
+    steps:
+      - name: Rewrite submodule SSH URL to HTTPS
+        shell: bash
+        run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: pnpm/action-setup@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Cache Electron binaries (macOS)
+        if: runner.os == 'macOS'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/Library/Caches/electron
+            ${{ github.workspace }}/.cache/electron-builder
+          key: electron-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: electron-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Cache Electron binaries (Linux)
+        if: runner.os == 'Linux'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cache/electron
+            ${{ github.workspace }}/.cache/electron-builder
+          key: electron-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: electron-${{ runner.os }}-
+
+      - name: Cache Electron binaries (Windows)
+        if: runner.os == 'Windows'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/AppData/Local/electron/Cache
+            ${{ github.workspace }}/.cache/electron-builder
+          key: electron-${{ runner.os }}-${{ hashFiles('**/pnpm-lock.yaml') }}
+          restore-keys: electron-${{ runner.os }}-
+
+      - name: Resolve dimina submodule SHA
+        id: dimina
+        shell: bash
+        run: echo "sha=$(git -C dimina rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache dimina container build
+        id: container-cache
+        uses: actions/cache@v5
+        with:
+          # Must cover EVERY dimina/fe artifact consumed host: build-container.js
+          # skips the whole dimina/fe build on a fingerprint hit (isFreshBuild), and
+          # packages/devtools/build-native-host.js copies service/render/common dist +
+          # container pageFrame.css out of the submodule during `pnpm run build`.
+          path: |
+            packages/devkit/fe/dimina-fe-container
+            dimina/fe/packages/service/dist
+            dimina/fe/packages/render/dist
+            dimina/fe/packages/common/dist
+            dimina/fe/packages/container/dist
+          key: dimina-container-v2-${{ runner.os }}-${{ runner.arch }}-${{ steps.dimina.outputs.sha }}-${{ hashFiles('packages/devtools/build-container.js', 'packages/devtools/vite.config.api.js', 'packages/devtools/container-runtime.js', 'packages/devtools/src/simulator/service-apis/**') }}
+
+      - name: Install workspace deps
+        run: pnpm install --frozen-lockfile --prefer-offline
+
+      # 必须排在任何进入 dimina/fe 的步骤之前：装依赖和 build:container 都会在那里
+      # 起 pnpm，而 submodule 声明的 pnpm 版本和本仓根不同时，切换会 exec 到
+      # pnpm.exe 并让这一步直接退出 2。脚本里写了完整来龙去脉。
+      - name: Use the runner's pnpm inside dimina/fe
+        run: node .github/scripts/use-runner-pnpm-for-dimina-fe.js
+
+      - name: Install dimina/fe deps
+        working-directory: dimina/fe
+        run: pnpm install --no-frozen-lockfile
+
+      - name: Bump versions for dev channel
+        if: inputs.channel == 'dev'
+        shell: bash
+        env:
+          DEV_VERSION_SUFFIX: ${{ needs.prepare.outputs.dev_version_suffix }}
+        run: node .github/scripts/bump-dev-version.js
+
+      - name: Read devtools version
+        id: ver
+        shell: bash
+        run: |
+          v="$(node -p "require('./packages/devtools/package.json').version")"
+          echo "version=$v" >> "$GITHUB_OUTPUT"
+
+      - name: Build dimina container
+        run: pnpm --filter @dimina-studio/devtools build:container
+
+      - name: Build devtools
+        run: pnpm run build
+
+      - name: Guard against accidental native deps
+        shell: bash
+        run: |
+          leaks=$(find node_modules -name '*.node' \
+            -not -path '*/fsevents/**' \
+            -not -path '*/@esbuild/**' \
+            -not -path '*/esbuild-*/**' \
+            -not -path '*/@oxc-*/**' \
+            -not -path '*/oxc-*/**' \
+            -not -path '*/@rolldown/**' \
+            -not -path '*/@rolldown+*/**' \
+            -not -path '*/rolldown-*/**' \
+            -not -path '*/@parcel/watcher*/**' \
+            -not -path '*/@parcel+watcher*/**' \
+            -not -path '*/lightningcss-*/**' \
+            -not -path '*/iconv-corefoundation/**' \
+            -not -path '*/@electron-internal/**' \
+            -not -path '*/@electron-internal+extract-zip*/**' \
+            | head -5)
+          if [ -n "$leaks" ]; then
+            echo "::error::native .node binaries found; revisit npmRebuild:false"
+            echo "$leaks"
+            exit 1
+          fi
+
+      - name: Package Electron app
+        working-directory: packages/devtools
+        # electron-builder defaults to the host arch when no --x64/--arm64 flag
+        # is given; mac needs it explicit since two mac runners (arm64 + Intel)
+        # now share this job.
+        env:
+          CSC_LINK: ${{ matrix.platform == 'mac' && inputs.channel == 'release' && secrets.CSC_LINK || '' }}
+          CSC_KEY_PASSWORD: ${{ matrix.platform == 'mac' && inputs.channel == 'release' && secrets.CSC_KEY_PASSWORD || '' }}
+        run: |
+          args=(--${{ matrix.platform }}${{ matrix.platform == 'mac' && format(' --{0}', matrix.arch) || '' }} --publish never)
+          if [[ "${{ inputs.channel }}" == release && "${{ matrix.platform }}" == mac ]]; then
+            args+=("-c.mac.forceCodeSigning=true")
+          fi
+          pnpm dist "${args[@]}
+
+      - name: Verify packaged Electron locale resources
+        working-directory: packages/devtools
+        run: pnpm run verify:electron-locales ${{ matrix.platform }}
+
+      - name: Name macOS update metadata by architecture
+        if: matrix.platform == 'mac'
+        shell: bash
+        working-directory: packages/devtools/release
+        run: mv latest-mac.yml "latest-mac-${{ matrix.arch }}.yml"
+
+      # The compile toolchain's native bindings (@esbuild/<platform>,
+      # @oxc-parser/binding-<platform>) must ship in app.asar.unpacked or the
+      # packaged app fails at compile time. electron-builder silently drops a
+      # binding whose version loses the pnpm public-hoist slot (e.g. two esbuild
+      # versions in the workspace), so assert presence on every platform build.
+      - name: Guard packaged compile toolchain natives
+        shell: bash
+        working-directory: packages/devtools
+        run: |
+          set -euo pipefail
+          unpacked=$(find release -type d -name app.asar.unpacked | head -1)
+          if [ -z "$unpacked" ]; then
+            echo "::error::app.asar.unpacked not found under packages/devtools/release"
+            exit 1
+          fi
+          for scope in @esbuild @oxc-parser; do
+            if ! ls -d "$unpacked/node_modules/$scope"/*/ >/dev/null 2>&1; then
+              echo "::error::$scope platform binding missing from packaged app ($unpacked)"
+              exit 1
+            fi
+          done
+
+      - name: Archive Linux build
+        if: inputs.channel == 'release' && matrix.platform == 'linux'
+        shell: bash
+        working-directory: packages/devtools/release
+        env:
+          VER: ${{ steps.ver.outputs.version }}
+        run: tar -czf "dimina-devtools-${VER}-linux-x64.tar.gz" linux-unpacked
+
+      - name: Archive Windows build
+        if: inputs.channel == 'release' && matrix.platform == 'win'
+        shell: pwsh
+        working-directory: packages/devtools/release
+        env:
+          VER: ${{ steps.ver.outputs.version }}
+        run: Compress-Archive -Path win-unpacked -DestinationPath "dimina-devtools-$env:VER-win-x64.zip"
+
+      - name: Upload built client (dev)
+        if: inputs.channel == 'dev'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dimina-devtools-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            packages/devtools/release/linux-unpacked
+            packages/devtools/release/win-unpacked
+            packages/devtools/release/*.dmg
+            packages/devtools/release/*.zip
+            packages/devtools/release/*.blockmap
+            packages/devtools/release/latest-mac-${{ matrix.arch }}.yml
+            packages/devtools/release/latest.yml
+            packages/devtools/release/latest-linux.yml
+          retention-days: 30
+          if-no-files-found: error
+
+      - name: Upload archived client (release)
+        if: inputs.channel == 'release'
+        uses: actions/upload-artifact@v7
+        with:
+          name: dimina-devtools-${{ matrix.platform }}-${{ matrix.arch }}
+          path: |
+            packages/devtools/release/dimina-devtools-*.tar.gz
+            packages/devtools/release/dimina-devtools-*.zip
+            packages/devtools/release/dimina-devtools-*.dmg
+            packages/devtools/release/dimina-devtools-*.exe
+            packages/devtools/release/dimina-devtools-*.AppImage
+            packages/devtools/release/*.blockmap
+            packages/devtools/release/latest*.yml
+          retention-days: 30
+          if-no-files-found: error
+
+  publish-npm:
+    needs: prepare
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      # OIDC token for npm provenance attestations (Sigstore). Required so
+      # `npm publish --provenance` can sign the tarball with GitHub's identity.
+      id-token: write
+    outputs:
+      notes: ${{ steps.publish.outputs.notes }}
+      changes: ${{ steps.publish.outputs.changes }}
+
+    steps:
+      - name: Rewrite submodule SSH URL to HTTPS
+        shell: bash
+        run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: pnpm/action-setup@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+          registry-url: https://registry.npmjs.org
+
+      - name: Resolve dimina submodule SHA
+        id: dimina
+        shell: bash
+        run: echo "sha=$(git -C dimina rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Cache dimina container build
+        id: container-cache
+        uses: actions/cache@v5
+        with:
+          # Must cover EVERY dimina/fe artifact consumed host: build-container.js
+          # skips the whole dimina/fe build on a fingerprint hit (isFreshBuild), and
+          # packages/devtools/build-native-host.js copies service/render/common dist +
+          # container pageFrame.css out of the submodule during `pnpm run build`.
+          path: |
+            packages/devkit/fe/dimina-fe-container
+            dimina/fe/packages/service/dist
+            dimina/fe/packages/render/dist
+            dimina/fe/packages/common/dist
+            dimina/fe/packages/container/dist
+          key: dimina-container-v2-${{ runner.os }}-${{ steps.dimina.outputs.sha }}-${{ hashFiles('packages/devtools/build-container.js', 'packages/devtools/vite.config.api.js', 'packages/devtools/container-runtime.js', 'packages/devtools/src/simulator/service-apis/**') }}
+
+      - name: Install workspace deps
+        run: pnpm install --frozen-lockfile --prefer-offline --ignore-scripts
+
+      # 同 build-clients：进 dimina/fe 之前先摘掉它声明的 pnpm 版本。
+      - name: Use the runner's pnpm inside dimina/fe
+        run: node .github/scripts/use-runner-pnpm-for-dimina-fe.js
+
+      - name: Install dimina/fe deps
+        working-directory: dimina/fe
+        run: pnpm install --no-frozen-lockfile --ignore-scripts
+
+      - name: Bump versions for dev channel
+        if: inputs.channel == 'dev'
+        shell: bash
+        env:
+          DEV_VERSION_SUFFIX: ${{ needs.prepare.outputs.dev_version_suffix }}
+        run: node .github/scripts/bump-dev-version.js
+
+      - name: Build dimina container
+        run: pnpm --filter @dimina-studio/devtools build:container
+
+      - name: Build packages
+        run: pnpm run build
+
+      # The regular turbo build emits runtime code only so test/type-check jobs
+      # do not recursively build dimina/fe assets. Publishing uses
+      # --ignore-scripts, so assemble the standalone package explicitly here.
+      - name: Build standalone Electron runtime package
+        run: pnpm --filter @dimina-studio/electron-runtime build:package
+
+      - name: Publish changed packages
+        id: publish
+        shell: bash
+        env:
+          CHANNEL: ${{ inputs.channel }}
+          NPM_TAG: ${{ needs.prepare.outputs.npm_tag }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: node .github/scripts/publish-packages.js
+
+  release:
+    if: inputs.channel == 'release'
+    needs: [prepare, build-clients, publish-npm]
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+          fetch-tags: true
+
+      - uses: pnpm/action-setup@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      - name: Install metadata verifier dependencies
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - uses: actions/download-artifact@v5
+        with:
+          path: artifacts
+          pattern: dimina-devtools-*
+          merge-multiple: true
+
+      - name: Merge and verify update metadata
+        shell: bash
+        run: |
+          set -euo pipefail
+          node packages/devtools/scripts/merge-mac-update-metadata.js artifacts artifacts/latest-mac-arm64.yml artifacts/latest-mac-x64.yml
+          rm artifacts/latest-mac-arm64.yml artifacts/latest-mac-x64.yml
+          node packages/devtools/scripts/verify-release-artifacts.js artifacts
+
+      - name: Build release notes
+        shell: bash
+        env:
+          NPM_NOTES: ${{ needs.publish-npm.outputs.notes }}
+          LAST_TAG: ${{ needs.prepare.outputs.last_release_tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "$LAST_TAG" ]] && git rev-parse --verify "refs/tags/$LAST_TAG" >/dev/null 2>&1; then
+            range="${LAST_TAG}..HEAD"
+            commits=$(git log --pretty=format:'- %s (%h)' "$range")
+            commit_header="## Commits since \`${LAST_TAG}\`"
+          else
+            commits=$(git log --pretty=format:'- %s (%h)' --max-count=20)
+            commit_header="## Recent commits"
+          fi
+          [[ -z "$commits" ]] && commits="_No new commits._"
+          {
+            printf '%s\n\n' "$NPM_NOTES"
+            printf '%s\n\n%s\n' "$commit_header" "$commits"
+          } > /tmp/release-notes.md
+          cat /tmp/release-notes.md
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_NAME: ${{ needs.prepare.outputs.release_name }}
+        shell: bash
+        run: |
+          set -e
+          gh release create "$RELEASE_NAME" \
+            --title "$RELEASE_NAME" \
+            --notes-file /tmp/release-notes.md \
+            artifacts/*

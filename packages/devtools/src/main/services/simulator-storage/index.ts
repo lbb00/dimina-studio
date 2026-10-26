@@ -1,0 +1,704 @@
+/**
+ * SimulatorStorageWatcher
+ *
+ * Attaches the Chrome DevTools Protocol debugger to the simulator <webview>
+ * and forwards `DOMStorage.*` events to the renderer host. The SAME simulator
+ * wc's debugger session is independently captured by network-forward
+ * (Network.* events); both acquire a lease from the shared `CdpSessionBroker`
+ * (see cdp-session/index.ts) rather than each attaching/detaching directly —
+ * releasing our own lease never forces a physical detach that would kill the
+ * other's capture.
+ *
+ * Trade-offs vs a preload-side localStorage.setItem hook:
+ *   + Uses standard browser protocol; no preload injection
+ *   + Captures every change including ones bypassing wx (direct
+ *     localStorage.setItem from devtools, etc.)
+ *   + Decouples panel UI from dimina runtime's wx implementation
+ *   - debugger.attach is mutually exclusive with a REAL Chrome DevTools window
+ *     (F12) attaching to the same target from outside the broker. If a user
+ *     opens one, the shared session detaches externally and events stop
+ *     flowing until they close it.
+ */
+
+import { app, webContents as wcStatic, type BrowserWindow, type WebContents } from 'electron'
+import { DisposableRegistry, type ConnectionRegistry, type Disposable } from 'electron-deck/main'
+import {
+  SimulatorElementChannel,
+  SimulatorStorageChannel,
+  type ElementInspection,
+  type StorageEvent,
+  type StorageItem,
+  type StorageWriteResult,
+  type SyncStorageChange,
+} from '../../../shared/ipc-channels.js'
+import { IpcRegistry, type SenderPolicy } from '../../utils/ipc-registry.js'
+import type { BridgeRouterHandle } from '../../ipc/bridge-router.js'
+import type { RenderInspector } from '../render-inspect/index.js'
+import { decodeStorageValue, encodeStorageValue, serviceStorage } from './service-storage-ops.js'
+import { createCdpSessionBroker, type CdpSessionBroker, type CdpSessionLease } from '../cdp-session/index.js'
+import { windowHostsWebContents } from './window-scope.js'
+
+/**
+ * Runtime async-storage handler (native-host). bridge-router routes async
+ * `wx.setStorage`/`getStorage`/… here so they hit the SAME service-host `file://`
+ * store as the sync APIs — eliminating the default-arch split where async writes
+ * landed on the simulator `http://` origin and sync writes on `file://`. Returns
+ * the value for the wx success callback (or throws → wx fail callback).
+ */
+export interface StorageApi {
+  invoke(appId: string, name: string, params: Record<string, unknown>): Promise<unknown>
+}
+
+/** Async wx storage API names routed through the unified service-window store. */
+export const STORAGE_API_NAMES = new Set([
+  'setStorage',
+  'getStorage',
+  'removeStorage',
+  'clearStorage',
+  'getStorageInfo',
+])
+
+/** The storage panel's return — a Disposable plus the native-host runtime hook. */
+export interface SimulatorStorageHandle extends Disposable {
+  /** Present only under native-host; wired to ctx.storageApi for bridge-router. */
+  storageApi: StorageApi | null
+  /**
+   * Native-host SYNC-storage liveness: bridge-router calls this on each
+   * `storageChanged` container message the service-host posts after a
+   * `setStorageSync`/`removeStorageSync`/`clearStorageSync`. Those write the
+   * service-host `localStorage` directly (bypassing main), so they'd otherwise
+   * leave the panel stale until reload — this pushes the matching `StorageEvent`.
+   */
+  onSyncStorageChange(appId: string, change: SyncStorageChange): void
+}
+
+function isSimulatorWebview(wc: WebContents): boolean {
+  if (wc.isDestroyed()) return false
+  if (wc.getType() !== 'webview') return false
+  return wc.getURL().includes('simulator.html')
+}
+
+/**
+ * `win` undefined means no owning window was configured — the legacy
+ * unscoped behavior, kept so single-window callers/tests that don't pass
+ * `window` keep compiling and behaving unchanged. Every production call
+ * site (window-runtime-services.ts) always passes its window.
+ */
+function belongsToWindow(win: BrowserWindow | undefined, wc: WebContents): boolean {
+  if (!win) return true
+  return windowHostsWebContents(win, wc)
+}
+
+function safeOff(target: { isDestroyed?: () => boolean; removeListener: (event: string, fn: (...args: unknown[]) => void) => unknown }, event: string, fn: (...args: unknown[]) => void): void {
+  try {
+    if (target.isDestroyed?.()) return
+    target.removeListener(event, fn)
+  } catch {
+    // best-effort
+  }
+}
+
+export interface SimulatorStorageOptions {
+  /**
+   * Sender gate applied to `SimulatorStorageChannel.GetSnapshot`.
+   * When provided, the IpcRegistry rejects invocations whose `event.sender`
+   * is not whitelisted (typically the workbench-wide policy that allows
+   * the main window renderer and overlay views only).
+   * Omitted in unit tests that mock the electron module.
+   */
+  senderPolicy?: SenderPolicy
+  /**
+   * Returns the appId of the currently-active project session, or null when
+   * no session is active. The simulator uses a fixed `persist:simulator`
+   * partition + simulator.html origin, so localStorage is shared across
+   * every project that has ever opened. The dimina runtime isolates writes
+   * with `${appId}_` prefixes; this callback lets the panel filter the
+   * CDP snapshot/event stream to the active appId.
+   */
+  getActiveAppId: () => string | null
+  /**
+   * Bridge-router accessor (native-host only). When present and native-host is
+   * on, element inspection targets the active render-host <webview> guest via
+   * `renderInspector` instead of the simulator iframe's `__simulatorData`.
+   */
+  bridge?: BridgeRouterHandle
+  /** Injects/drives the render-guest inspector; required for native-host inspect. */
+  renderInspector?: RenderInspector
+  /**
+   * Connection-layer registry (`electron-deck/main`). When provided,
+   * per-webContents teardowns are routed through `acquire(wc).own(cleanup)` so
+   * they fire deterministically on wc destroy / connection reset instead of the
+   * bespoke `wc.once('destroyed', cleanup)` hook. Optional so callers that have
+   * not adopted the connection layer compile and behave unchanged.
+   */
+  connections?: ConnectionRegistry
+  /**
+   * Shared CDP session broker (see cdp-session/index.ts) that owns the
+   * simulator wc's debugger session lifecycle — network-forward independently
+   * captures Network.* events on the SAME simulator wc, and an unconditional
+   * `debugger.detach()` here (the pre-migration behavior) would kill ITS
+   * capture too, exactly as an unconditional detach on its side would kill
+   * ours. Absent → a private broker is created and owned for this module's
+   * lifetime (torn down on `dispose()`), so existing standalone callers/tests
+   * compile and behave unchanged, just without cross-module session sharing.
+   */
+  broker?: CdpSessionBroker
+  /**
+   * Owning window (typically `mainWindow`). Scopes every simulator-webview
+   * discovery path (initial scan, `web-contents-created`, lazy re-find) to
+   * webviews that live inside THIS window — required in a multi-window
+   * workbench, where `webContents`/`app.on('web-contents-created')` are
+   * process-global and would otherwise let one window's instance attach to
+   * (and read/write through) another window's simulator. Optional so
+   * existing single-window callers/tests compile and keep their prior
+   * unscoped behavior.
+   */
+  window?: BrowserWindow
+}
+
+export function setupSimulatorStorage(
+  host: WebContents,
+  options: SimulatorStorageOptions,
+): SimulatorStorageHandle {
+  const registry = new DisposableRegistry()
+  const getActiveAppId = options.getActiveAppId
+
+  // Native-host: the mini-app's storage lives on the service-host window's
+  // file:// origin (sync-impls + the unified async path both write there), not
+  // the simulator <webview>'s http:// origin the CDP path attaches to. Resolve
+  // the service window fresh each call (the pre-warm pool can swap it on respawn).
+  function nativeServiceWc(): WebContents | null {
+    if (!options.bridge?.isNativeHost()) return null
+    return options.bridge.getServiceWc(getActiveAppId() ?? undefined)
+  }
+  // Own (and dispose on this module's own dispose()) a private broker only
+  // when the caller didn't supply a shared one.
+  const ownsBroker = !options.broker
+  const broker = options.broker ?? createCdpSessionBroker({ connections: options.connections })
+  let attachedWc: WebContents | null = null
+  let attachedLease: CdpSessionLease | null = null
+  /**
+   * Cached origin discovered via `executeJavaScript('location.origin')` on
+   * first use. The simulator <webview> loads `simulator.html` from a stable
+   * scheme/host/port for the lifetime of the CDP attach, so caching avoids an
+   * extra IPC round-trip per write call. Cleared on detach.
+   */
+  let cachedOrigin: string | null = null
+
+  /** Active appId prefix (e.g. `wx123_`), or null when no session is active. */
+  function activePrefix(): string | null {
+    const appId = getActiveAppId()
+    return appId ? `${appId}_` : null
+  }
+
+  /**
+   * Release OUR OWN lease on the simulator wc's shared session — never a
+   * physical `debugger.detach()`. The SAME wc is independently captured by
+   * network-forward (Network.* events); an unconditional detach here would
+   * kill its capture too. The broker (cdp-session/index.ts) alone decides
+   * when an actual detach happens.
+   */
+  function detachFromSim(): void {
+    if (!attachedWc) return
+    attachedWc = null
+    cachedOrigin = null
+    const lease = attachedLease
+    attachedLease = null
+    lease?.dispose()
+  }
+
+  async function attachToSim(wc: WebContents): Promise<void> {
+    if (attachedWc === wc) return
+    if (wc.isDestroyed()) return
+    detachFromSim()
+
+    const lease = broker.acquire(wc)
+    if (!lease) {
+      console.warn('[storage-watcher] attach failed: debugger session unavailable')
+      return
+    }
+    try {
+      await lease.send('DOMStorage.enable')
+    } catch (e) {
+      console.warn('[storage-watcher] attach failed:', (e as Error).message)
+      lease.dispose()
+      return
+    }
+
+    lease.onMessage((method, params) => forwardCdpMessage(method, params))
+    // Fires on external detach OR the wc being destroyed (see cdp-session's
+    // design doc) — either way our tracking of this wc as "attached" is stale.
+    lease.onDetach(() => {
+      if (attachedWc === wc) { attachedWc = null; attachedLease = null }
+    })
+
+    attachedWc = wc
+    attachedLease = lease
+  }
+
+  function forwardCdpMessage(method: string, params: unknown): void {
+    if (host.isDestroyed()) return
+    const p = params as Record<string, unknown>
+    const prefix = activePrefix()
+    let evt: StorageEvent
+    switch (method) {
+      case 'DOMStorage.domStorageItemAdded': {
+        const key = String(p.key)
+        if (prefix && !key.startsWith(prefix)) return
+        evt = { type: 'added' as const, key, newValue: String(p.newValue ?? '') }
+        break
+      }
+      case 'DOMStorage.domStorageItemUpdated': {
+        const key = String(p.key)
+        if (prefix && !key.startsWith(prefix)) return
+        evt = {
+          type: 'updated' as const,
+          key,
+          oldValue: String(p.oldValue ?? ''),
+          newValue: String(p.newValue ?? ''),
+        }
+        break
+      }
+      case 'DOMStorage.domStorageItemRemoved': {
+        const key = String(p.key)
+        if (prefix && !key.startsWith(prefix)) return
+        evt = { type: 'removed' as const, key }
+        break
+      }
+      case 'DOMStorage.domStorageItemsCleared':
+        // Forwarded unfiltered: this CDP event only fires on a true
+        // origin-wide `localStorage.clear()`. The dimina runtime's
+        // `wx.clearStorageSync` removes keys one-by-one (see
+        // `simulator-api-storage.ts`), so prefix-scoped clears arrive as
+        // a stream of `domStorageItemRemoved` events that the filter above
+        // handles. Any `cleared` we see here is genuinely a full-origin
+        // wipe (e.g. from DevTools console) and should propagate.
+        evt = { type: 'cleared' as const }
+        break
+      default:
+        return
+    }
+    host.send(SimulatorStorageChannel.Event, evt)
+  }
+
+  /**
+   * Lazy-attach guard.
+   *
+   * The `attachToSim` call inside `web-contents-created` only fires after the
+   * simulator webview emits `did-finish-load`. UI affordances (the storage
+   * panel's "+ 新增", inline edit, delete, clear) are reachable as soon as
+   * the right-pane tab renders — which can happen BEFORE that load completes.
+   * Without this hook, a fast click bounces off `!attachedWc` and the write
+   * IPC returns `{ ok:false, error:'simulator not attached' }` silently,
+   * leaving the user (and the e2e suite) staring at a no-op.
+   *
+   * Behaviour:
+   *   - If a wc is already attached, this is a fast no-op.
+   *   - If no wc is attached, scan `webContents.getAllWebContents()` for a
+   *     simulator webview and `await attachToSim()` on the first match.
+   *   - If no simulator exists at all, leave `attachedWc` null so the
+   *     caller's existing `not attached` error branch fires — preserving
+   *     the documented contract exercised by `Set returns ok:false when
+   *     no simulator is attached`.
+   */
+  async function ensureAttached(): Promise<void> {
+    if (attachedWc && !attachedWc.isDestroyed()) return
+    const sim = findSimulatorWebContents(options.window)
+    if (!sim) return
+    await attachToSim(sim)
+  }
+
+  async function getStorageId(): Promise<{ securityOrigin: string; isLocalStorage: true } | null> {
+    if (!attachedWc || attachedWc.isDestroyed()) return null
+    if (!cachedOrigin) {
+      try {
+        cachedOrigin = String(await attachedWc.executeJavaScript('location.origin'))
+      } catch {
+        return null
+      }
+    }
+    return { securityOrigin: cachedOrigin, isLocalStorage: true }
+  }
+
+  async function withStorageWrite(
+    fn: (ctx: { wc: WebContents; storageId: { securityOrigin: string; isLocalStorage: true } }) => Promise<StorageWriteResult>,
+  ): Promise<StorageWriteResult> {
+    await ensureAttached()
+    if (!attachedWc || attachedWc.isDestroyed()) {
+      return { ok: false, error: 'simulator not attached' }
+    }
+    const storageId = await getStorageId()
+    if (!storageId) return { ok: false, error: 'failed to resolve simulator origin' }
+    try {
+      return await fn({ wc: attachedWc, storageId })
+    }
+    catch (e) {
+      return { ok: false, error: (e as Error).message }
+    }
+  }
+
+  async function withStorageRead<T>(
+    fallback: T,
+    fn: (ctx: { wc: WebContents; storageId: { securityOrigin: string; isLocalStorage: true } }) => Promise<T>,
+  ): Promise<T> {
+    await ensureAttached()
+    if (!attachedWc || attachedWc.isDestroyed()) return fallback
+    try {
+      const storageId = await getStorageId()
+      if (!storageId) return fallback
+      return await fn({ wc: attachedWc, storageId })
+    }
+    catch {
+      return fallback
+    }
+  }
+
+  /**
+   * Push a storage event synthesised from the write path itself, in addition
+   * to whatever CDP forwards via `DOMStorage.domStorageItem*`. The CDP
+   * tracker has a small registration window after `DOMStorage.enable`
+   * during which the first write's notification can be dropped — the e2e
+   * `add a new entry via the footer form` case races exactly this gap when
+   * the storage tab is clicked before the simulator finishes loading and
+   * `ensureAttached()` performs the first attach. Renderer state reducers
+   * are idempotent on the same key, so an extra push from here cannot
+   * duplicate rows even when CDP also delivers.
+   *
+   * Active-prefix filtering mirrors `forwardCdpMessage` so the panel's
+   * per-appId filter behaves identically whether the event came from CDP
+   * or from this synthesised push.
+   */
+  function pushSyntheticEvent(evt: { type: 'added'; key: string; newValue: string } | { type: 'updated'; key: string; oldValue: string; newValue: string } | { type: 'removed'; key: string }): void {
+    if (host.isDestroyed()) return
+    const prefix = activePrefix()
+    if (prefix && !evt.key.startsWith(prefix)) return
+    host.send(SimulatorStorageChannel.Event, evt)
+  }
+
+  async function withNativeStorageWrite(
+    action: (storage: ReturnType<typeof serviceStorage>) => Promise<void>,
+    notify: () => void,
+  ): Promise<StorageWriteResult> {
+    const nativeWc = nativeServiceWc()
+    if (!nativeWc) return { ok: false, error: 'native service host unavailable' }
+    try {
+      await action(serviceStorage(nativeWc))
+      notify()
+      return { ok: true }
+    } catch (e) {
+      return { ok: false, error: (e as Error).message }
+    }
+  }
+
+  async function setItem(key: string, value: string): Promise<StorageWriteResult> {
+    const nativeWc = nativeServiceWc()
+    if (nativeWc) {
+      return withNativeStorageWrite(storage => storage.writeOne(key, value), () => pushSyntheticEvent({ type: 'added', key, newValue: value }))
+    }
+    return withStorageWrite(async ({ wc, storageId }) => {
+      await wc.debugger.sendCommand('DOMStorage.setDOMStorageItem', { storageId, key, value })
+      pushSyntheticEvent({ type: 'added', key, newValue: value })
+      return { ok: true }
+    })
+  }
+
+  async function removeItem(key: string): Promise<StorageWriteResult> {
+    const nativeWc = nativeServiceWc()
+    if (nativeWc) {
+      return withNativeStorageWrite(storage => storage.removeOne(key), () => pushSyntheticEvent({ type: 'removed', key }))
+    }
+    return withStorageWrite(async ({ wc, storageId }) => {
+      await wc.debugger.sendCommand('DOMStorage.removeDOMStorageItem', { storageId, key })
+      pushSyntheticEvent({ type: 'removed', key })
+      return { ok: true }
+    })
+  }
+
+  // Scoped clear: when an appId is active, removes only its prefixed keys so
+  // we don't nuke other projects' state sharing the simulator partition.
+  // Falls back to origin-wide `DOMStorage.clear` only when no active appId is
+  // set (matches the snapshot filter's documented null-fallback).
+  async function clearScoped(): Promise<StorageWriteResult> {
+    const nativeWc = nativeServiceWc()
+    if (nativeWc) {
+      return withNativeStorageWrite(async (storage) => {
+        const prefix = activePrefix()
+        if (prefix) await storage.clearPrefix(prefix)
+        else await storage.clearAll()
+      }, () => { if (!host.isDestroyed()) host.send(SimulatorStorageChannel.Event, { type: 'cleared' }) })
+    }
+    return withStorageWrite(async ({ wc, storageId }) => {
+      const prefix = activePrefix()
+      if (!prefix) {
+        await wc.debugger.sendCommand('DOMStorage.clear', { storageId })
+        return { ok: true }
+      }
+      const result = (await wc.debugger.sendCommand('DOMStorage.getDOMStorageItems', {
+        storageId,
+      })) as { entries: Array<[string, string]> }
+      for (const [key] of result.entries) {
+        if (!key.startsWith(prefix)) continue
+        await wc.debugger.sendCommand('DOMStorage.removeDOMStorageItem', { storageId, key })
+      }
+      return { ok: true }
+    })
+  }
+
+  // Origin-wide clear regardless of the active appId — wipes every project's
+  // state in the shared simulator partition. The renderer guards this with a
+  // confirm dialog; we don't second-guess here.
+  async function clearAll(): Promise<StorageWriteResult> {
+    const nativeWc = nativeServiceWc()
+    if (nativeWc) {
+      return withNativeStorageWrite(storage => storage.clearAll(), () => { if (!host.isDestroyed()) host.send(SimulatorStorageChannel.Event, { type: 'cleared' }) })
+    }
+    return withStorageWrite(async ({ wc, storageId }) => {
+      await wc.debugger.sendCommand('DOMStorage.clear', { storageId })
+      return { ok: true }
+    })
+  }
+
+  async function getSnapshot(): Promise<StorageItem[]> {
+    const nativeWc = nativeServiceWc()
+    if (nativeWc) {
+      const prefix = activePrefix()
+      if (!prefix) return []
+      const entries = await serviceStorage(nativeWc).readAll(prefix)
+      // Keys returned with the `${appId}_` prefix intact (same as the CDP path).
+      return entries.map(([key, value]) => ({ key, value }))
+    }
+    return withStorageRead<StorageItem[]>([], async ({ wc, storageId }) => {
+      const result = (await wc.debugger.sendCommand('DOMStorage.getDOMStorageItems', {
+        storageId,
+      })) as { entries: Array<[string, string]> }
+      const prefix = activePrefix()
+      const filtered = prefix
+        ? result.entries.filter(([key]) => key.startsWith(prefix))
+        : result.entries
+      // Keys are returned with their `${appId}_` prefix intact: every write
+      // path (Set/Remove) keys off the raw storage key. The Storage panel
+      // display-strips the prefix for readability (storage-panel.tsx), so the
+      // wire keys stay raw while the UI shows clean, Chrome-like keys.
+      return filtered.map(([key, value]) => ({ key, value }))
+    })
+  }
+
+  // Attach to any simulator webview that already exists (project may have
+  // been opened before this function runs).
+  for (const wc of wcStatic.getAllWebContents()) {
+    if (isSimulatorWebview(wc) && belongsToWindow(options.window, wc)) {
+      void attachToSim(wc)
+      break
+    }
+  }
+
+  // Catch new simulator webviews on creation. did-finish-load is the right
+  // moment because getURL() may still be 'about:blank' at creation.
+  // Track each per-wc listener so it can be removed on storage dispose,
+  // and also self-clean when the wc is destroyed.
+  const wcSubs = new Map<WebContents, DisposableRegistry>()
+  const onWcCreated = (_event: Electron.Event, wc: WebContents) => {
+    const sub = new DisposableRegistry()
+    wcSubs.set(wc, sub)
+
+    const onFinishLoad = () => {
+      if (isSimulatorWebview(wc) && belongsToWindow(options.window, wc)) void attachToSim(wc)
+    }
+    wc.on('did-finish-load', onFinishLoad)
+    sub.add(() => safeOff(wc as unknown as Parameters<typeof safeOff>[0], 'did-finish-load', onFinishLoad as (...args: unknown[]) => void))
+
+    const onWcDestroyed = () => {
+      void sub.disposeAll().catch(() => {})
+      wcSubs.delete(wc)
+    }
+    if (options.connections) {
+      // Per-wc cleanup (this wc's did-finish-load sub + wcSubs entry). Route
+      // through the connection layer so it fires deterministically on wc
+      // destroy / reset rather than the bespoke 'destroyed' hook.
+      options.connections.acquire(wc).own(onWcDestroyed)
+    } else {
+      try {
+        wc.once('destroyed', onWcDestroyed)
+      } catch {
+        // fake-wc safety (unit tests pass a wc without a real emitter)
+      }
+    }
+  }
+  app.on('web-contents-created', onWcCreated)
+  registry.add(() => {
+    app.removeListener('web-contents-created', onWcCreated)
+  })
+  registry.add(async () => {
+    const subs = Array.from(wcSubs.values())
+    wcSubs.clear()
+    for (const sub of subs) {
+      await sub.disposeAll().catch(() => {})
+    }
+  })
+
+  // Element inspection. Default path delegates to the simulator iframe's
+  // `__simulatorData`. Native-host path targets the active render-host
+  // <webview> guest via the render inspector (the page DOM lives there, not in
+  // the simulator iframe). Looked up fresh each call so a DevTools-induced CDP
+  // detach (default path) or a render-guest swap (native path) is tolerated.
+  async function inspectElement(sid: string): Promise<ElementInspection | null> {
+    if (!sid) return null
+    if (options.bridge?.isNativeHost() && options.renderInspector) {
+      const wc = options.bridge.getActiveRenderWc(getActiveAppId() ?? undefined)
+      if (!wc) return null
+      return options.renderInspector.highlight(wc, sid)
+    }
+    const sim = findSimulatorWebContents(options.window)
+    if (!sim) return null
+    try {
+      const result = (await sim.executeJavaScript(
+        `window.__simulatorData && window.__simulatorData.highlightElement ? window.__simulatorData.highlightElement(${JSON.stringify(sid)}) : null`,
+      )) as ElementInspection | null
+      return result ?? null
+    } catch (e) {
+      console.warn('[simulator-element] inspect failed:', (e as Error).message)
+      return null
+    }
+  }
+
+  async function clearElementInspection(): Promise<void> {
+    if (options.bridge?.isNativeHost() && options.renderInspector) {
+      const wc = options.bridge.getActiveRenderWc(getActiveAppId() ?? undefined)
+      if (wc) await options.renderInspector.unhighlight(wc)
+      return
+    }
+    const sim = findSimulatorWebContents(options.window)
+    if (!sim) return
+    try {
+      await sim.executeJavaScript(
+        'window.__simulatorData && window.__simulatorData.unhighlightElement && window.__simulatorData.unhighlightElement()',
+      )
+    } catch {
+      // best-effort
+    }
+  }
+
+  // IPC handlers — gated by the workbench SenderPolicy when provided so this
+  // module routes through the same C-stage sender white-list as every other
+  // workbench-built-in (main-window renderer + overlay views only). Without
+  // a policy (unit tests with mocked electron) the registry is a transparent
+  // pass-through and still owns the removeHandler lifecycle.
+  const ipc = new IpcRegistry(options.senderPolicy)
+  ipc.handle(SimulatorStorageChannel.GetSnapshot, () => getSnapshot())
+  ipc.handle(SimulatorStorageChannel.GetActivePrefix, () => activePrefix() ?? '')
+  ipc.handle(SimulatorStorageChannel.Set, (_event, payload: { key: string; value: string }) =>
+    setItem(String(payload?.key ?? ''), String(payload?.value ?? '')),
+  )
+  ipc.handle(SimulatorStorageChannel.Remove, (_event, payload: { key: string }) =>
+    removeItem(String(payload?.key ?? '')),
+  )
+  ipc.handle(SimulatorStorageChannel.Clear, () => clearScoped())
+  ipc.handle(SimulatorStorageChannel.ClearAll, () => clearAll())
+  ipc.handle(SimulatorElementChannel.Inspect, (_event, sid: string) => inspectElement(sid))
+  ipc.handle(SimulatorElementChannel.Clear, () => clearElementInspection())
+  registry.add(ipc)
+
+  // Detach active CDP session last
+  registry.add(() => detachFromSim())
+  // Only detach sessions we self-attached if we own the broker's lifecycle —
+  // a shared/injected broker keeps serving other consumers past our dispose().
+  registry.add(() => {
+    if (ownsBroker) broker.dispose()
+  })
+
+  // ── Runtime async-storage unification (native-host) ───────────────────────
+  // bridge-router routes async wx.setStorage/etc. here so they hit the SAME
+  // service-host file:// store as the sync APIs (no more split origin). After a
+  // write we push a synthetic panel event so the Storage panel stays live on
+  // in-app writes (executeJavaScript writes don't emit CDP DOMStorage events).
+  async function runtimeInvoke(
+    appId: string,
+    name: string,
+    params: Record<string, unknown>,
+  ): Promise<unknown> {
+    const wc = options.bridge?.getServiceWc(appId)
+    if (!wc) throw new Error('service-host window unavailable')
+    const ss = serviceStorage(wc)
+    const prefix = `${appId}_`
+    const key = typeof params.key === 'string' ? params.key : ''
+    const fullKey = prefix + key
+    switch (name) {
+      case 'setStorage': {
+        const value = encodeStorageValue(params.data)
+        await ss.writeOne(fullKey, value)
+        pushSyntheticEvent({ type: 'added', key: fullKey, newValue: value })
+        return { errMsg: 'setStorage:ok' }
+      }
+      case 'getStorage': {
+        const raw = await ss.readOne(fullKey)
+        if (raw === null) throw new Error('getStorage:fail data not found')
+        return { data: decodeStorageValue(raw), errMsg: 'getStorage:ok' }
+      }
+      case 'removeStorage': {
+        await ss.removeOne(fullKey)
+        pushSyntheticEvent({ type: 'removed', key: fullKey })
+        return { errMsg: 'removeStorage:ok' }
+      }
+      case 'clearStorage': {
+        await ss.clearPrefix(prefix)
+        if (appId === getActiveAppId() && !host.isDestroyed()) {
+          host.send(SimulatorStorageChannel.Event, { type: 'cleared' })
+        }
+        return { errMsg: 'clearStorage:ok' }
+      }
+      case 'getStorageInfo': {
+        const entries = await ss.readAll(prefix)
+        const keys = entries.map(([k]) => k.slice(prefix.length))
+        let currentSize = 0
+        for (const [, v] of entries) currentSize += v ? v.length * 2 : 0
+        return { keys, currentSize, limitSize: 10 * 1024 * 1024, errMsg: 'getStorageInfo:ok' }
+      }
+      default:
+        throw new Error(`unsupported storage api ${name}`)
+    }
+  }
+
+  const storageApi: StorageApi | null = options.bridge?.isNativeHost()
+    ? { invoke: runtimeInvoke }
+    : null
+
+  /**
+   * SYNC wx storage APIs run inside the service-host window and write
+   * `localStorage` directly, so they never reach `setItem`/`runtimeInvoke` here.
+   * The service-host posts the change over `DiminaServiceBridge` and bridge-router
+   * routes it here so the panel stays live. Only the ACTIVE app's changes are
+   * surfaced (the panel shows one app); the key already carries the `${appId}_`
+   * prefix, matching the CDP / async event shape.
+   */
+  function onSyncStorageChange(appId: string, change: SyncStorageChange): void {
+    if (appId !== getActiveAppId()) return
+    if (host.isDestroyed()) return
+    switch (change.op) {
+      case 'set':
+        pushSyntheticEvent({ type: 'added', key: change.key, newValue: change.value })
+        break
+      case 'remove':
+        pushSyntheticEvent({ type: 'removed', key: change.key })
+        break
+      case 'clear':
+        host.send(SimulatorStorageChannel.Event, { type: 'cleared' })
+        break
+    }
+  }
+
+  return { dispose: () => registry.dispose(), storageApi, onSyncStorageChange }
+}
+
+// Element inspection delegates to the simulator preload's __simulatorData
+// bridge via executeJavaScript. Looked up independently from `attachedWc` so
+// it keeps working when the user opens Chrome DevTools and the storage
+// debugger detaches (debugger.attach is mutually exclusive with F12).
+// Scoped to `win` for the same reason as the attach paths above — an
+// unscoped scan would resolve to whichever window's simulator comes first
+// in the process-global registry, not necessarily this instance's own.
+function findSimulatorWebContents(win: BrowserWindow | undefined): WebContents | null {
+  for (const wc of wcStatic.getAllWebContents()) {
+    if (isSimulatorWebview(wc) && belongsToWindow(win, wc)) return wc
+  }
+  return null
+}

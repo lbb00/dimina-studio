@@ -1,0 +1,60 @@
+/**
+ * Shared probes for driving the embedded VS Code workbench WebContentsView
+ * from e2e specs: find the workbench wc
+ * by polling for `window.__WB_STATUS`, then `executeJavaScript` against it.
+ *
+ * Hardened against a sibling webContents stuck mid-load (hot-reload DeviceShell
+ * respawns leave one around while we probe):
+ *  - skip webContents without a committed URL or still loading —
+ *    `executeJavaScript` queues a did-stop-loading waiter unless Electron sees
+ *    both a URL and a settled main frame. Repeatedly probing a newly-created
+ *    blank wc otherwise leaks one waiter per call;
+ *  - race every probe/eval with a timeout so one stuck wc costs a poll
+ *    iteration, not the entire test timeout.
+ */
+import type { ElectronApplication } from '@playwright/test'
+import { pollUntil } from './helpers'
+
+/** Run `expr` inside the embedded workbench's WebContentsView. */
+export async function runInWorkbench<T>(app: ElectronApplication, expr: string): Promise<T> {
+  return app.evaluate(async ({ webContents }, e) => {
+    const withTimeout = <V>(p: Promise<V>, ms: number): Promise<V> =>
+      Promise.race([p, new Promise<never>((_, rej) => setTimeout(() => rej(new Error('wc probe timeout')), ms))])
+    const wcs = webContents
+      .getAllWebContents()
+      .filter((wc) => !wc.isDestroyed() && wc.getURL() !== '' && !wc.isLoading())
+    for (const wc of wcs) {
+      try {
+        const s = await withTimeout(
+          wc.executeJavaScript('typeof window.__WB_STATUS === "string" ? window.__WB_STATUS : null'),
+          3000,
+        )
+        if (typeof s === 'string') return withTimeout(wc.executeJavaScript(e), 30_000)
+      } catch {
+        // not the workbench wc (or not yet probeable) — try the next one
+      }
+    }
+    throw new Error('workbench webContents not found')
+  }, expr) as Promise<T>
+}
+
+/** The workbench's `window.__WB_STATUS`, or `null` when no workbench wc is probeable yet. */
+export async function workbenchStatus(app: ElectronApplication): Promise<string | null> {
+  return runInWorkbench<string>(app, 'window.__WB_STATUS').catch(() => null)
+}
+
+/**
+ * Wait for the workbench WCV which the visible editor dock slot naturally
+ * attaches. Returns the status so a spec can assert on it.
+ */
+export async function attachWorkbenchAndWaitReady(
+  electronApp: ElectronApplication,
+  timeoutMs = 90_000,
+): Promise<string | null> {
+  return pollUntil(
+    () => workbenchStatus(electronApp),
+    (s) => s === 'workbench-ready' || s === 'exthost-alive',
+    timeoutMs,
+    500,
+  )
+}

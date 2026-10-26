@@ -1,0 +1,83 @@
+@import '@dimina-studio/design/css/index.css';
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* Tailwind's preflight is emitted after imported styles and otherwise resets
+   every unspecified border to a fixed gray. Reapply shadcn's semantic border
+   at the base layer so plain `border` utilities keep following the theme. */
+@layer base {
+  *, *::before, *::after {
+    border-color: var(--border);
+  }
+}
+
+/* The category rail stays dimmer in dark mode, including the default dark
+   palette where no theme class is present. Explicit light themes override it
+   without changing the shared ring token. */
+[data-host-sidebar-root] [data-active-indicator] {
+  opacity: 0.65;
+}
+
+:root.light [data-host-sidebar-root] [data-active-indicator] {
+  opacity: 1;
+}
+
+@media (prefers-color-scheme: light) {
+  :root:not(.dark) [data-host-sidebar-root] [data-active-indicator] {
+    opacity: 1;
+  }
+}
+
+/* ── devtools-owned tokens ──────────────────────────────────────────────────
+   The shared palette, base element styles and the electron-deck dock skin all
+   live in @dimina-studio/design (imported above). What stays here is specific to
+   this app: the simulator's hardware chrome and the window layout metrics.
+   Anything reusable belongs upstream in that
+   package instead.
+ ──────────────────────────────────────────────────────────────────────────── */
+
+:root {
+  /* Simulator chrome — the toolbar rows and WCV-placeholder desk around the
+     phone use the shared muted surface.
+     --color-sim-bg MUST stay equal to simDeskBg() (main/utils/theme.ts) and
+     .device-shell-root (device-shell.css) — see those sites. Only the PHONE
+     ITSELF stays hardware-dark regardless of theme: --color-sim-screen (the
+     physical device screen, behind the mini-app's own content),
+     --color-phone-shell, --color-phone-border. */
+  --color-sim-bg:       var(--muted);
+  --color-sim-bottom:   var(--muted);
+  --color-sim-screen:   oklch(0 0 0);  /* simulator screen / webview background */
+  --color-phone-shell:  oklch(0.222 0.003 285);
+  --color-phone-border: oklch(0.302 0.003 285);
+
+  /* Layout */
+  --header-h:   40px;
+  --splitter-w: 4px;
+}
+
+@media (prefers-color-scheme: light) {
+  :root {
+    /* Simulator chrome — see the block above. --color-sim-bg MUST stay equal
+       to simDeskBg() (main/utils/theme.ts) and .device-shell-root
+       (device-shell.css). */
+    --color-sim-bg:     var(--muted);
+    --color-sim-bottom: var(--muted);
+  }
+}
+
+/* ── Application shell ──────────────────────────────────────────────────────
+   @dimina-studio/design's base.css deliberately leaves the page unsized so a
+   scrolling document keeps working. This is a fixed-viewport desktop app, so
+   pin it here. */
+html, body {
+  height: 100vh;
+  overflow: hidden;
+}
+
+#root {
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}

@@ -1,0 +1,198 @@
+import { readFile } from 'node:fs/promises'
+import { fileURLToPath } from 'node:url'
+import { execFileSync } from 'node:child_process'
+import path from 'node:path'
+import { describePnpmConfigKeyLocation } from '../../../scripts/pnpm-config-location.mjs'
+import { resolveInstalledVersion, resolveTransitiveVersion } from './resolve-installed-version.js'
+import { TRANSITIVE_DEP_PATHS } from './transitive-dep-pairs.js'
+
+function printUsage() {
+  console.log(
+    'Usage: node scripts/check-wasm-alignment.js\n\n' +
+      'Fails if packages/compiler resolves any shared dependency to a version that\n' +
+      'differs from upstream-lockfile-snapshot.json — a frozen record of what upstream\n' +
+      '@dimina/compiler (dimina submodule) resolved at the commit the snapshot was taken\n' +
+      'at — or if the submodule has since moved to a different commit than the snapshot\n' +
+      'records. Also checks the wasm/native build pairs\n' +
+      'oxc-parser/@oxc-parser/binding-wasm32-wasi and esbuild/esbuild-wasm.\n' +
+      'Requires packages/compiler to be installed (pnpm install); does not need\n' +
+      "dimina/fe's own workspace installed. Run scripts/snapshot-upstream-versions.js to\n" +
+      'refresh the snapshot after bumping the dimina submodule pointer or upgrading a\n' +
+      'packages/compiler dependency upstream also shares.',
+  )
+}
+
+if (process.argv.includes('--help') || process.argv.includes('-h')) {
+  printUsage()
+  process.exit(0)
+}
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const root = path.resolve(__dirname, '..')
+const kitPkgPath = path.join(root, 'package.json')
+const diminaRoot = path.resolve(root, '../../dimina')
+const repoRoot = path.resolve(root, '../..')
+const snapshotPath = path.join(root, 'upstream-lockfile-snapshot.json')
+
+async function readJson(p) {
+  return JSON.parse(await readFile(p, 'utf8'))
+}
+
+const kitPkg = await readJson(kitPkgPath)
+
+let snapshot
+try {
+  snapshot = await readJson(snapshotPath)
+} catch (err) {
+  console.error(
+    `check-wasm-alignment: could not read ${snapshotPath} (${err.message})\n` +
+      'Run: node scripts/snapshot-upstream-versions.js',
+  )
+  process.exit(2)
+}
+
+let diminaCommit
+try {
+  diminaCommit = execFileSync('git', ['-C', diminaRoot, 'rev-parse', 'HEAD'], { encoding: 'utf8' }).trim()
+} catch (err) {
+  console.error(
+    `check-wasm-alignment: could not read dimina submodule HEAD (${err.message})\n` +
+      'Run: git submodule update --init dimina',
+  )
+  process.exit(2)
+}
+
+// The snapshot is only valid for the exact submodule commit it was taken at:
+// upstream's own package.json (and therefore which deps it resolves) can
+// change between commits. A pointer bump that doesn't come with a refreshed
+// snapshot is a stale-data problem, not a real version mismatch — surface it
+// as its own failure so it isn't confused with an actual drift.
+if (diminaCommit !== snapshot.diminaCommit) {
+  console.error(
+    `check-wasm-alignment: upstream-lockfile-snapshot.json was captured at dimina@${snapshot.diminaCommit}, ` +
+      `but the submodule is now pinned to dimina@${diminaCommit}.\n` +
+      'Run: node scripts/snapshot-upstream-versions.js, then commit the refreshed snapshot.',
+  )
+  process.exit(2)
+}
+
+// Scoped to deps kit itself declares. Packages dmcc source imports but kit
+// doesn't declare (e.g. @vue/shared, pulled in only via compatibility.js)
+// aren't independently resolved by kit at all — kit's esbuild config bundles
+// (inlines) anything not in its NODE_EXTERNAL list straight from the dimina/fe
+// source file that imports it, so that code is always upstream's current
+// install by construction. Drift is only possible for deps kit resolves on
+// its own — i.e. the ones it declares here.
+const kitDeps = { ...kitPkg.dependencies, ...kitPkg.devDependencies }
+
+const mismatches = []
+const unresolved = []
+
+// Every shared dep here is part of dmcc's actual compile pipeline (e.g.
+// @vue/compiler-sfc's compileStyle/compileTemplate drive CSS scope-hash and
+// template codegen — not a cosmetic tool), so all of them get the same
+// resolved-version check as the wasm toolchain, not just oxc-parser/esbuild.
+for (const name of Object.keys(kitDeps)) {
+  if (!(name in snapshot.versions)) continue
+
+  const kitVersion = await resolveInstalledVersion(kitPkgPath, name)
+  const upstreamVersion = snapshot.versions[name]
+  if (!kitVersion) {
+    unresolved.push(`  ${name}: kit=unresolved upstream(snapshot)=${upstreamVersion}`)
+    continue
+  }
+  if (kitVersion !== upstreamVersion) {
+    mismatches.push(`  ${name}: kit resolves ${kitVersion}, upstream snapshot resolves ${upstreamVersion}`)
+  }
+}
+
+// The wasm builds of oxc-parser/esbuild are peer/dev deps here (native
+// bindings aren't available in the browser); their version must track the
+// non-wasm package they're a build target of, or the browser bundle can
+// silently run a different parser/bundler version than the node bundle.
+// Both sides of this pair live in kit's own package.json/node_modules, so
+// resolution never depends on dimina/fe being installed.
+const wasmPairs = [
+  ['oxc-parser', '@oxc-parser/binding-wasm32-wasi'],
+  ['esbuild', 'esbuild-wasm'],
+]
+
+for (const [nativeName, wasmName] of wasmPairs) {
+  const nativeVersion = await resolveInstalledVersion(kitPkgPath, nativeName)
+  const wasmVersion = await resolveInstalledVersion(kitPkgPath, wasmName)
+  if (!nativeVersion || !wasmVersion) {
+    unresolved.push(`  ${wasmName}/${nativeName}: kit=${nativeVersion ?? 'unresolved'}/${wasmVersion ?? 'unresolved'}`)
+    continue
+  }
+  if (nativeVersion !== wasmVersion) {
+    mismatches.push(`  ${wasmName} resolves ${wasmVersion}, does not match ${nativeName} resolving ${nativeVersion}`)
+  }
+}
+
+// Neither side declares these — kit and dmcc each install their own
+// `autoprefixer`, which independently pulls in `browserslist`/`caniuse-lite`
+// (and `caniuse-lite` again, on a SEPARATE edge, via `browserslist`'s own
+// dependency on it). A patch-level caniuse-lite drift alone can flip which
+// vendor prefix `overrideBrowserslist: ['cover 99.5%']` resolves to, so this
+// has to be checked even though it's invisible to the kitDeps loop above
+// (kit's own package.json never lists these names directly). Resolved by
+// walking each full path from `autoprefixer`'s own install dir
+// (resolveTransitiveVersion), not kit's package root — pnpm's isolated
+// node_modules means resolving straight from the root can land in an
+// unrelated hoisted copy and misreport it as aligned.
+for (const depPath of TRANSITIVE_DEP_PATHS) {
+  const key = depPath.join('>')
+  const upstreamVersion = snapshot.transitiveVersions?.[key]
+  if (!upstreamVersion) {
+    unresolved.push(`  ${key}: snapshot has no recorded version — run scripts/snapshot-upstream-versions.js`)
+    continue
+  }
+
+  const kitVersion = await resolveTransitiveVersion(kitPkgPath, depPath)
+  if (!kitVersion) {
+    unresolved.push(`  ${key}: kit=unresolved upstream(snapshot)=${upstreamVersion}`)
+    continue
+  }
+  if (kitVersion !== upstreamVersion) {
+    // pnpm only reliably honors a 2-segment override key (still true on the
+    // pinned 12.3.4). A literal join of a 3+-segment path (e.g.
+    // "autoprefixer>browserslist>caniuse-lite") either throws
+    // ERR_PNPM_INVALID_SELECTOR (unversioned) or silently no-ops (version-
+    // qualified on every segment) — the only form that actually takes effect
+    // is a 2-segment key with a VERSION-QUALIFIED PARENT, anchored on the
+    // second-to-last package in the chain (e.g. "browserslist@4.28.7>caniuse-lite").
+    // The suggested key below is built that way so copy-pasting it works.
+    const parentPathKey = depPath.slice(0, -1).join('>')
+    const parentVersion = snapshot.transitiveVersions?.[parentPathKey]
+    const parentSpec = depPath.length <= 2 ? depPath[depPath.length - 2] : `${depPath[depPath.length - 2]}@${parentVersion ?? '<parent-version>'}`
+    const suggestedKey = `${parentSpec}>${depPath[depPath.length - 1]}`
+    mismatches.push(
+      `  ${key}: kit resolves ${kitVersion}, upstream snapshot resolves ${upstreamVersion} — ` +
+        `pin the kit-side version under \`overrides\` in ${describePnpmConfigKeyLocation(repoRoot, 'overrides')} ` +
+        `("${suggestedKey}": "${upstreamVersion}"), then pnpm install.`,
+    )
+  }
+}
+
+if (unresolved.length > 0) {
+  console.error(
+    'check-wasm-alignment: could not resolve installed versions for some shared deps — ' +
+      'this proves nothing either way, so treat it as a setup failure, not a pass:\n' +
+      unresolved.join('\n') +
+      '\nRun: pnpm install',
+  )
+  process.exit(2)
+}
+
+if (mismatches.length > 0) {
+  console.error(
+    'check-wasm-alignment: drift between packages/compiler and the upstream @dimina/compiler ' +
+      'snapshot (dimina submodule) — this package re-implements dmcc against the same toolchain:\n' +
+      mismatches.join('\n') +
+      '\nRealign the drifted side (bump/pin in package.json, then pnpm install) and rebuild ' +
+      '(pnpm --filter @dimina-studio/compiler build).',
+  )
+  process.exit(1)
+}
+
+console.log('check-wasm-alignment: packages/compiler deps aligned with upstream @dimina/compiler snapshot')

@@ -1,0 +1,232 @@
+import type React from 'react'
+import { useRef } from 'react'
+import type { RefObject } from 'react'
+import { DEFAULT_DEVICE } from '@devicekit/devices'
+import type { AppInfo, SessionRuntimeStatusPayload } from '@/shared/api'
+import type { CompileConfig, CompileModeState } from '@/shared/types'
+import type { AppDataPanelSource, StoragePanelSource, WxmlPanelSource } from '@dimina-studio/inspect'
+import { DEFAULT_RIGHT_PANE_STATE } from '../types'
+import type { RightPaneState, RightPaneTabId } from '../types'
+
+import { useDevice, type DeviceHookResult } from './use-device'
+import { useSession } from './use-session'
+import type { CompileEvent, CompileLogEntry } from './use-session'
+import { useSimulator } from './use-simulator'
+import { usePanelData } from './use-panel-data'
+import { useRightPane } from './use-right-pane'
+import { usePopover } from './use-popover'
+import type { CompileStatus, DeviceType } from './runtime-types'
+
+// ── Public shapes ───────────────────────────────────────────────────────────
+
+export type { CompileStatus, DeviceType } from './runtime-types'
+
+export interface ProjectRuntimeControllerProps {
+  projectPath: string
+  initialDevice?: DeviceType
+  initialRightPane?: RightPaneState
+}
+
+interface SessionSlice {
+  compileStatus: CompileStatus
+  appInfo: AppInfo | null
+  port: number
+  pages: string[]
+  /** The page 普通编译 launches. */
+  entryPagePath: string
+  /** Named compile modes + selection — the toolbar label reads from this. */
+  compileModes: CompileModeState
+  /** Gates the compile-mode button — see `SessionHookResult.compileModesReady`. */
+  compileModesReady: boolean
+  compileConfig: CompileConfig
+  /** 编译 tab event log (useSession passthrough — feeds BottomDebugPanel). */
+  compileEvents: CompileEvent[]
+  /** 编译 tab per-line dmcc log (useSession passthrough). */
+  compileLogs: CompileLogEntry[]
+  /** Clears both compileEvents and compileLogs. */
+  clearCompileEvents: () => void
+  relaunch: () => Promise<void>
+  /** Latest runtime-lifecycle push for the active session; null when healthy/unreported, or right after a hot-reload starts a fresh launch round. */
+  runtimeStatus: SessionRuntimeStatusPayload | null
+  /** True once the project's file watcher has died for this session. */
+  watcherDead: boolean
+}
+
+// The controller re-exposes the device hook's state as-is; only the splitter
+// handler is narrowed (the dock layout never passes a `side`).
+type DeviceSlice = Pick<
+  DeviceHookResult,
+  | 'device'
+  | 'zoom'
+  | 'simPanelWidth'
+  | 'setSimPanelWidth'
+  | 'handleDeviceChange'
+  | 'openDevicePicker'
+  | 'handleZoomChange'
+  | 'sendDeviceInfo'
+> & {
+  handleSplitterDrag: (e: React.MouseEvent) => void
+}
+
+interface SimulatorSlice {
+  simulatorRef: RefObject<HTMLElement | null>
+  simulatorUrl: string
+  /** Bare page path — AppData's bridge auto-follow matches on it. */
+  currentPage: string
+  /** Visible page as `pagePath?k=v&…` — the page-path bar shows/copies this. */
+  currentRoute: string
+}
+
+interface PanelDataSlice {
+  wxmlSource: WxmlPanelSource
+  wxmlEnabled: boolean
+  storageSource: StoragePanelSource
+  storageEnabled: boolean
+  appDataSource: AppDataPanelSource
+  appDataEnabled: boolean
+}
+
+interface RightPaneSlice {
+  rightPane: RightPaneState
+  selectRightPane: (panelId: RightPaneTabId) => void
+  toggleRightPaneVisible: () => void
+}
+
+interface PopoverSlice {
+  compileDropdownRef: RefObject<HTMLDivElement | null>
+  showCompilePanel: boolean
+  toggleCompilePanel: () => void
+}
+
+export interface ProjectRuntimeController {
+  session: SessionSlice
+  device: DeviceSlice
+  simulator: SimulatorSlice
+  panelData: PanelDataSlice
+  rightPane: RightPaneSlice
+  popover: PopoverSlice
+}
+
+// ── Controller ──────────────────────────────────────────────────────────────
+
+/**
+ * Central controller for the ProjectRuntime feature. Composes session,
+ * device, simulator, panel-data, right-pane and popover state into a single
+ * entry point so `project-runtime.tsx` stays declarative.
+ *
+ * Side-effect ordering preserved from the pre-controller hooks:
+ *  1. openProject → getProjectPages / getCompileModeState → compileStatus ready
+ *  2. compileStatus ready → webview attach + sendDeviceInfo + ipc-message
+ *  3. popover:closed → clear showCompilePanel; popover:apply → save + relaunch
+ */
+export function useProjectRuntimeController(
+  props: ProjectRuntimeControllerProps,
+): ProjectRuntimeController {
+  const {
+    projectPath,
+    initialDevice = DEFAULT_DEVICE,
+    initialRightPane = DEFAULT_RIGHT_PANE_STATE,
+  } = props
+
+  const simulatorRef = useRef<HTMLElement | null>(null)
+  const compileDropdownRef = useRef<HTMLDivElement | null>(null)
+
+  // ── Compose sub-hooks ────────────────────────────────────────────────────
+
+  const deviceHook = useDevice({ initialDevice })
+
+  const sessionHook = useSession({
+    projectPath,
+  })
+
+  const simulatorHook = useSimulator({
+    compileStatus: sessionHook.compileStatus,
+    sendDeviceInfo: deviceHook.sendDeviceInfo,
+    simPanelWidthRef: deviceHook.simPanelWidthRef,
+    deviceRef: deviceHook.deviceRef,
+    appInfo: sessionHook.appInfo,
+    compileConfig: sessionHook.compileConfig,
+    port: sessionHook.port,
+    projectPath,
+    // Watcher-rebuild signal (resurrects the hot-reload guard a later refactor
+    // deleted): each bump makes use-simulator respawn the DeviceShell once.
+    hotReloadToken: sessionHook.hotReloadToken,
+    // Explicit-relaunch signal: forces a hard re-attach at startPage even when
+    // the URL is unchanged (重新编译 / retry resetting the drifted page).
+    relaunchNonce: sessionHook.relaunchNonce,
+  })
+
+  const panelDataHook = usePanelData({
+    compileStatus: sessionHook.compileStatus,
+    activePagePath: simulatorHook.currentPage,
+  })
+
+  const rightPaneHook = useRightPane({
+    initialRightPane,
+  })
+
+  const popoverHook = usePopover({
+    pages: sessionHook.pages,
+    entryPagePath: sessionHook.entryPagePath,
+    // The page the simulator is actually showing, so 以当前页面新建编译模式
+    // captures where the user navigated rather than where the session started.
+    currentRoute: simulatorHook.currentRoute,
+    compileDropdownRef,
+  })
+
+  // ── Assemble slices ───────────────────────────────────────────────────────
+
+  return {
+    session: {
+      compileStatus: sessionHook.compileStatus,
+      appInfo: sessionHook.appInfo,
+      port: sessionHook.port,
+      pages: sessionHook.pages,
+      entryPagePath: sessionHook.entryPagePath,
+      compileModes: sessionHook.compileModes,
+      compileModesReady: sessionHook.compileModesReady,
+      compileConfig: sessionHook.compileConfig,
+      compileEvents: sessionHook.compileEvents,
+      compileLogs: sessionHook.compileLogs,
+      clearCompileEvents: sessionHook.clearCompileEvents,
+      relaunch: sessionHook.relaunch,
+      runtimeStatus: sessionHook.runtimeStatus,
+      watcherDead: sessionHook.watcherDead,
+    },
+    device: {
+      device: deviceHook.device,
+      zoom: deviceHook.zoom,
+      simPanelWidth: deviceHook.simPanelWidth,
+      setSimPanelWidth: deviceHook.setSimPanelWidth,
+      handleDeviceChange: deviceHook.handleDeviceChange,
+      openDevicePicker: deviceHook.openDevicePicker,
+      handleZoomChange: deviceHook.handleZoomChange,
+      handleSplitterDrag: deviceHook.handleSplitterDrag,
+      sendDeviceInfo: deviceHook.sendDeviceInfo,
+    },
+    simulator: {
+      simulatorRef,
+      simulatorUrl: simulatorHook.simulatorUrl,
+      currentPage: simulatorHook.currentPage,
+      currentRoute: simulatorHook.currentRoute,
+    },
+    panelData: {
+      wxmlSource: panelDataHook.wxmlSource,
+      wxmlEnabled: panelDataHook.wxmlEnabled,
+      storageSource: panelDataHook.storageSource,
+      storageEnabled: panelDataHook.storageEnabled,
+      appDataSource: panelDataHook.appDataSource,
+      appDataEnabled: panelDataHook.appDataEnabled,
+    },
+    rightPane: {
+      rightPane: rightPaneHook.rightPane,
+      selectRightPane: rightPaneHook.selectRightPane,
+      toggleRightPaneVisible: rightPaneHook.toggleRightPaneVisible,
+    },
+    popover: {
+      compileDropdownRef,
+      showCompilePanel: popoverHook.showCompilePanel,
+      toggleCompilePanel: popoverHook.toggleCompilePanel,
+    },
+  }
+}

@@ -1,0 +1,608 @@
+// dmcc adapter: drives @dimina/compiler's compile functions inline (no
+// worker_threads) against a caller-injected fs. web-compiler owns NO fs
+// implementation — the host passes a node:fs replacement (e.g. memfs) already
+// seeded with the project source under workPath.
+import os from 'node:os'
+import path from 'node:path'
+import process from 'node:process'
+import { setFs, resetFs } from './shims/fs.js'
+
+// The compiler source lives in dimina-studio's `dimina` submodule. This package
+// sits inside the same dimina-studio checkout, so the path stays relative to the
+// submodule — no machine-specific absolute prefix. esbuild resolves these at
+// bundle time (see scripts/build-compiler.js).
+import {
+  storeInfo, resetStoreInfo, getPages, getAppId, getAppName, getWorkPath, getTargetPath,
+  getAppStyleScopeId, getDependencyGraph, getTemplateExts, getViewScriptTags,
+} from '../../../dimina/fe/packages/compiler/src/env.js'
+import { createDist } from '../../../dimina/fe/packages/compiler/src/common/publish.js'
+import { compileConfig } from '../../../dimina/fe/packages/compiler/src/core/index.js'
+import { DependencyGraph } from '../../../dimina/fe/packages/compiler/src/common/dependency-graph.js'
+import { NpmBuilder } from '../../../dimina/fe/packages/compiler/src/common/npm-builder.js'
+// __resetAssets appended at bundle time (clears the never-cleared assetsMap cache)
+import { __resetAssets } from '../../../dimina/fe/packages/compiler/src/common/utils.js'
+
+// --- lazy per-stage toolchain loading ---------------------------------------
+//
+// The three stage compilers are loaded on demand, NOT statically: each one drags a
+// heavy toolchain behind it (style: sass + cssnano + less + postcss ≈ 150MB RSS per
+// realm; view: cheerio + @vue/compiler-sfc; logic: esbuild + oxc), and every realm
+// that imports this module — the pool's main thread AND each worker_threads stage
+// worker, each with its own isolated module registry — would otherwise pay for ALL
+// of them while using at most one. Deferring the import keeps every realm loaded
+// with exactly its own stage's toolchain (setupCompile's own chain — config-compiler,
+// NpmBuilder, env/publish/utils — is all light, so the main thread loads none).
+//
+// NOTE for bundling: this only stays lazy if the dynamic imports become real runtime
+// chunks. scripts/build-compiler.js builds the node bundles with esbuild `splitting`
+// for exactly that reason — a single-file bundle would hoist each chunk's external
+// `import 'sass'` back to the entry's top level and silently defeat the laziness.
+//
+// The per-stage export surfaces (compileJS/writeCompileRes/__reset*/__setEnableSourcemap
+// are partly appended at bundle time — see build-compiler.js exportAppend):
+//   logic: compileJS, writeCompileRes, __resetLogicState, __setEnableSourcemap
+//   view:  compileML, __resetViewState, __setEnableSourcemap
+//   style: compileSS, __resetStyleState
+const STAGE_IMPORTERS = {
+  logic: () => import('../../../dimina/fe/packages/compiler/src/core/logic-compiler.js'),
+  view: () => import('../../../dimina/fe/packages/compiler/src/core/view-compiler.js'),
+  style: () => import('../../../dimina/fe/packages/compiler/src/core/style-compiler.js'),
+}
+const stageLoads = new Map()   // stage -> in-flight/settled import promise
+const stageModules = new Map() // stage -> SETTLED module namespace (reset targets)
+
+function loadStageModule(stage) {
+  if (!stageLoads.has(stage)) {
+    // Only a SUCCESSFUL load is memoized. A rejection (missing chunk, transient fs
+    // error) clears the memo so the next call re-imports — a repaired install
+    // recovers in place instead of replaying the cached failure forever.
+    const load = STAGE_IMPORTERS[stage]().then((m) => {
+      stageModules.set(stage, m)
+      return m
+    }, (err) => {
+      if (stageLoads.get(stage) === load) stageLoads.delete(stage)
+      throw err
+    })
+    stageLoads.set(stage, load)
+  }
+  return stageLoads.get(stage)
+}
+
+/**
+ * Warm ONE stage's toolchain ahead of its first compile (e.g. a stage worker that
+ * knows its identity at spawn). Memoized; a failure surfaces again on the first
+ * compile's own load, so callers may fire-and-forget.
+ * @param {'logic'|'view'|'style'} stage
+ */
+export function preloadStage(stage) {
+  if (!STAGE_IMPORTERS[stage]) {
+    return Promise.reject(new Error(`[compiler] unknown compile stage "${stage}" (expected ${STAGE_NAMES.join('/')})`))
+  }
+  return loadStageModule(stage).then((mod) => {
+    // style-compiler.js's own toolchain (sass) is intentionally lazy — see loadSass
+    // there — so importing the module above only warms its STATIC deps (esbuild,
+    // @vue/compiler-sfc, postcss, autoprefixer), not sass. A stage worker calling
+    // preloadStage already knows its stage identity at spawn time, before any project
+    // ever picked a `.scss`/`.sass` file, so warm sass here too — "preload by stage
+    // identity alone", matching the module import's own eagerness for the other
+    // realms. Fire-and-forget: a failed sass load surfaces again, unchanged, the next
+    // time style-compiler.js's own loadSass() runs (same memoized loader) — this
+    // opportunistic warm-up can never mask or swallow a real toolchain failure, and a
+    // rejection here must never take the worker down.
+    if (stage === 'style') mod.__preloadStyleToolchain().catch(() => {})
+  })
+}
+
+function makeProgress() {
+  let c = 0
+  return {
+    get completedTasks() { return c },
+    set completedTasks(v) { c = v },
+  }
+}
+
+// The compiler reads the app id from project.config.json's `appid` and bakes it
+// into output resource paths (`/{appId}/main/static/…`) and the container's
+// `?appId=` query. An embedder that feeds a minimal project may omit
+// project.config.json, which would leave the id `undefined` — corrupting those
+// paths and the container load with no error surfaced. When no appid is present
+// we inject this fixed local-preview id. A constant (not a content hash) keeps
+// the id stable across content edits so a live-edit/HMR host preserves page state.
+const SYNTHETIC_APPID = 'dmlocalpreview'
+
+// Ensure the injected fs has a project.config.json carrying a usable `appid`.
+// Honors a caller-provided one; synthesizes a stable fallback when absent.
+// NOTE: when appid is missing this WRITES project.config.json into the caller's
+// fs. It refuses to clobber a file that isn't valid JSON, and rejects a
+// malformed appid — better a clear error than silent data loss / corrupt paths.
+function ensureAppIdFs(fs, configPath) {
+  let config = {}
+  if (fs.existsSync(configPath)) {
+    const raw = fs.readFileSync(configPath, 'utf8')
+    try {
+      config = JSON.parse(raw)
+    } catch {
+      throw new Error(`[compiler] ${configPath} is not valid JSON; refusing to overwrite it`)
+    }
+    if (config === null || typeof config !== 'object' || Array.isArray(config)) {
+      throw new Error(`[compiler] ${configPath} must be a JSON object`)
+    }
+  }
+  const { appid } = config
+  if (appid !== undefined && appid !== '' && typeof appid !== 'string') {
+    throw new Error(`[compiler] ${configPath} "appid" must be a non-empty string`)
+  }
+  if (!appid) {
+    config.appid = SYNTHETIC_APPID
+    const slash = configPath.lastIndexOf('/')
+    if (slash > 0) fs.mkdirSync(configPath.slice(0, slash), { recursive: true })
+    fs.writeFileSync(configPath, JSON.stringify(config))
+  }
+}
+
+// Products are read as BYTES and only turned into a string when they really are
+// UTF-8 text. Reading a PNG with 'utf8' replaces every invalid byte with U+FFFD and
+// nothing can undo that — the images the compiler copies into `main/static` used to
+// come back corrupted, so callers had to go read the fs themselves to get real
+// assets. Strict decoding is exact in both directions: text is byte-identical to
+// before, and anything that isn't valid UTF-8 stays raw bytes.
+// ignoreBOM keeps a leading U+FEFF in the string instead of eating it: by default
+// TextDecoder strips it, so a BOM-prefixed file would come out three bytes shorter
+// than it went in — exactly the kind of silent rewrite this function exists to avoid.
+const utf8Strict = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true })
+
+// "Does it decode as UTF-8" catches PNGs and fonts, but it is not a reliable test for
+// "is this text": short binary files can be valid UTF-8 by accident. The smallest legal
+// .wasm module is its 8-byte header (00 61 73 6D 01 00 00 00) — every byte decodes, so
+// it would come back as a string and blow up in WebAssembly.instantiate(), which takes
+// bytes only. For file types that are binary by definition, skip the decode entirely.
+// Extension-only, so a text product can never be pushed onto this list by its contents.
+const BINARY_EXTS = new Set([
+  '.wasm',
+  '.png', '.jpg', '.jpeg', '.gif', '.webp', '.avif', '.bmp', '.ico', '.tif', '.tiff',
+  '.ttf', '.otf', '.woff', '.woff2', '.eot',
+  '.mp3', '.wav', '.ogg', '.m4a', '.mp4', '.webm', '.mov',
+  '.pdf', '.zip', '.gz', '.br',
+])
+
+function decodeProduct(bytes, relPath) {
+  // A fs backend that ignores the missing encoding and hands back a string is taken
+  // at its word — same as before this function existed.
+  if (typeof bytes === 'string') return bytes
+  const dot = relPath.lastIndexOf('.')
+  if (dot > relPath.lastIndexOf('/') && BINARY_EXTS.has(relPath.slice(dot).toLowerCase())) return bytes
+  try {
+    return utf8Strict.decode(bytes)
+  } catch {
+    return bytes
+  }
+}
+
+// Walk the injected fs under targetPath and collect { relPath: content }. Uses
+// only readdirSync({withFileTypes}) + readFileSync — inside the fs contract.
+// Fail-fast: a missing target dir, an unreadable product, or a fs that ignores
+// { withFileTypes: true } throws (with the path) rather than silently dropping
+// products or crashing obscurely later.
+function readOutputs(fs, target) {
+  const prefix = target.endsWith('/') ? target : `${target}/`
+  const out = {}
+  const seen = new Set()
+  const walk = (dir) => {
+    if (seen.has(dir)) return // guard against symlink cycles in exotic fs backends
+    seen.add(dir)
+    const entries = fs.readdirSync(dir, { withFileTypes: true })
+    if (!Array.isArray(entries)) {
+      throw new Error(`[compiler] fs.readdirSync(${dir}, { withFileTypes: true }) must return an array`)
+    }
+    for (const e of entries) {
+      if (!e || typeof e.isDirectory !== 'function') {
+        throw new Error(`[compiler] fs.readdirSync must return Dirent entries with isDirectory()/isFile() (got ${typeof e} under ${dir})`)
+      }
+      const full = `${dir}/${e.name}`
+      if (e.isDirectory()) walk(full)
+      else {
+        const rel = full.slice(prefix.length)
+        out[rel] = decodeProduct(fs.readFileSync(full), rel)
+      }
+    }
+  }
+  walk(prefix.slice(0, -1))
+  return out
+}
+
+// --- miniprogram_npm scan scope -------------------------------------------
+//
+// Why this exists — the builder's and the resolver's search spaces must agree.
+//
+// dmcc's NpmBuilder mirrors every directory literally named `miniprogram_npm`
+// it can find into the output, preserving each dir's project-relative path. Its
+// own findMiniprogramNpmDirs walks the WHOLE project tree with zero exclusions:
+// node_modules, hidden directories (.git, test snapshots), and build outputs
+// that happen to live inside the project are all scanned, and any
+// miniprogram_npm buried in them is faithfully copied into the product.
+//
+// The consumer of those copies is NpmResolver, and it defines what is actually
+// reachable: when a compiled source file imports a bare package name, the
+// resolver probes `<ancestor>/miniprogram_npm` walking UP from the importing
+// file's directory to the project root (WeChat's npm addressing). Compiled
+// sources only ever live in the real source tree, so a miniprogram_npm sitting
+// under node_modules, under a dot-directory, or inside a previous build's
+// output can never appear on any lookup chain — copying it is pure junk output,
+// and dropping it can never break resolution.
+//
+// The unexcluded scan is worse than bloat: when the caller publishes the output
+// INSIDE the project (outputDir under workPath), the next build scans the
+// previous build's published npm copies and re-copies them one level deeper —
+// dist/<appId>/dist/<appId>/… grows without bound, one level per build, until
+// path length blows past the OS limit (ENAMETOOLONG) and publishing crashes.
+// Test-artifact snapshots that embed old outputs (e.g. an e2e-captured user-data
+// dir committed into the project) feed the same loop.
+//
+// The fix lives HERE, not in dmcc: the dimina/ submodule is vendored read-only,
+// and setupCompile below is the single place this package instantiates the
+// builder — overriding the scan at that seam fixes every consumer (memfs
+// compileMiniApp, browser pool, Node disk pool) without forking upstream.
+//
+// Scan rules, each mirroring a resolver invariant — and each matching WeChat's
+// own packaging behavior (developers.weixin.qq.com/miniprogram/dev/devtools/npm.html):
+//   - skip `node_modules`: it holds RAW npm inputs; miniprogram_npm is their
+//     built counterpart, and the resolver never looks inside node_modules.
+//     WeChat states it outright: node_modules 目录不会参与编译、上传和打包中.
+//   - skip dot-directories: hidden dirs are never mini-program source, so no
+//     importing file (and hence no lookup chain) can originate there. This is
+//     also what keeps .git and e2e user-data snapshots out. WeChat's packager
+//     likewise drops dot-prefixed entries from preview/upload by default.
+//   - skip `excludeRoots` subtrees: the staging dir plus any caller-declared
+//     publish target (see npmScanExclude) — a build's own output must never
+//     become a later build's input, which is exactly the nesting feedback loop.
+// Everything else — project root, subpackage roots, any ancestor level of a
+// source file — is kept, byte-for-byte where dmcc would have put it. Keeping
+// every non-excluded level is deliberate: WeChat generates one miniprogram_npm
+// per package.json (so subpackage roots are legitimate), and packNpmRelationList
+// / miniprogramNpmDistDir let projects place it at ARBITRARY directories — a
+// root-only allowlist would over-filter valid projects.
+// scripts/test-npm-scan.js pins both directions (kept and excluded).
+//
+// Evidence backing the rules above (WeChat official docs + field reports):
+//   - npm addressing (upward, per-ancestor miniprogram_npm), per-package.json
+//     placement, packNpmRelationList/miniprogramNpmDistDir custom targets, and
+//     the node_modules exclusion quote all come from
+//     https://developers.weixin.qq.com/miniprogram/dev/devtools/npm.html
+//   - dot-prefixed entries are dropped from preview/upload by default; the
+//     packOptions prefix/folder ignore rules target exactly this class:
+//     https://developers.weixin.qq.com/miniprogram/dev/devtools/projectconfig.html
+//   - WeChat performs NO whole-tree scan for miniprogram_npm at all — it
+//     GENERATES the dir from package.json/node_modules and packs by dependency
+//     analysis, so output-recursion is structurally impossible there. The
+//     whole-tree walk is dmcc's own approximation of that pipeline; these
+//     exclusions restore the boundaries the approximation dropped.
+//
+// Uses the caller-injected fs directly (the same backend the rest of setup runs
+// against), not the module-level fs the parent class closes over.
+function findScopedNpmDirs(fs, workPath, excludeRoots) {
+  // Normalized to trailing-slash prefixes so `${dir}/` startsWith covers both
+  // the excluded root itself and everything below it.
+  const excluded = excludeRoots
+    .filter(Boolean)
+    .map((p) => (p.endsWith('/') ? p : `${p}/`))
+  const npmDirs = []
+  const walk = (dir, rel) => {
+    if (!fs.existsSync(dir)) return
+    for (const item of fs.readdirSync(dir, { withFileTypes: true })) {
+      if (!item.isDirectory()) continue
+      const { name } = item
+      if (name === 'node_modules' || name.startsWith('.')) continue
+      const full = `${dir}/${name}`
+      if (excluded.some((ex) => `${full}/`.startsWith(ex))) continue
+      const childRel = rel ? `${rel}/${name}` : name
+      // A found miniprogram_npm is recorded but NOT descended into — package
+      // contents are the copy step's job, matching dmcc's own scan shape.
+      if (name === 'miniprogram_npm') npmDirs.push(childRel)
+      else walk(full, childRel)
+    }
+  }
+  walk(workPath.endsWith('/') ? workPath.slice(0, -1) : workPath, '')
+  return npmDirs
+}
+
+// NpmBuilder with ONLY the discovery step replaced by the scoped scan above.
+// Copy layout, package-json dependency chasing, and the file-type filter are
+// inherited unchanged, so for every legitimate miniprogram_npm dir the output
+// stays dmcc-identical — the override narrows WHICH dirs ship, never HOW.
+class ScopedNpmBuilder extends NpmBuilder {
+  constructor(workPath, targetPath, { fs, excludeRoots }) {
+    super(workPath, targetPath)
+    this._fs = fs
+    this._excludeRoots = excludeRoots
+  }
+
+  findMiniprogramNpmDirs() {
+    return findScopedNpmDirs(this._fs, this.workPath, this._excludeRoots)
+  }
+}
+
+// The sync fs subset the compiler actually calls on the compileMiniApp path.
+// readdirSync must additionally support { withFileTypes: true }.
+const REQUIRED_FS = [
+  'existsSync', 'readFileSync', 'readdirSync', 'statSync',
+  'writeFileSync', 'mkdirSync', 'copyFileSync', 'rmSync',
+]
+
+function assertFs(fs) {
+  if (!fs || typeof fs !== 'object') {
+    throw new Error('[compiler] compileMiniApp requires { fs }: inject a node:fs replacement (e.g. createFsFromVolume(memfs Volume)) seeded with the project source under workPath')
+  }
+  const missing = REQUIRED_FS.filter((m) => typeof fs[m] !== 'function')
+  if (missing.length) {
+    throw new Error(`[compiler] injected fs is missing required method(s): ${missing.join(', ')}. Needs the sync subset ${REQUIRED_FS.join('/')}, and readdirSync must support { withFileTypes: true }.`)
+  }
+}
+
+// --- compile stages --------------------------------------------------------
+// The three stages read project source and each write their OWN product files;
+// no stage reads back another stage's products (verified against the compiler),
+// so they can run in any order — or concurrently in separate realms/workers over
+// a shared fs. Each function keeps the exact per-stage sequencing of the original
+// single-pass compile so output stays byte-for-byte identical.
+
+async function runLogicStage(pages, progress) {
+  const { compileJS, writeCompileRes } = await loadStageModule('logic')
+  // Main first (produces mainRes). A subpackage that references a shared component
+  // belonging to the main package reverse-injects it into mainRes, so the main
+  // package's logic.js must be written LAST — after every subpackage has run.
+  const mainRes = await compileJS(pages.mainPages, null, null, progress)
+  for (const [root, sub] of Object.entries(pages.subPages)) {
+    const subRes = await compileJS(sub.info, root, sub.independent ? [] : mainRes, progress)
+    await writeCompileRes(subRes, root)
+  }
+  await writeCompileRes(mainRes, null)
+}
+
+async function runViewStage(pages, progress) {
+  const { compileML } = await loadStageModule('view')
+  await compileML(pages.mainPages, null, progress)
+  for (const [root, sub] of Object.entries(pages.subPages)) {
+    await compileML(sub.info, root, progress)
+  }
+}
+
+async function runStyleStage(pages, progress, { sourcemap = false } = {}) {
+  const { compileSS } = await loadStageModule('style')
+  // app.css is prepended for the main package, matching the original ordering.
+  const styleMain = [{ path: 'app', id: getAppStyleScopeId() }, ...pages.mainPages]
+  await compileSS(styleMain, null, progress, { sourcemap })
+  for (const [root, sub] of Object.entries(pages.subPages)) {
+    await compileSS(sub.info, root, progress, { sourcemap })
+  }
+}
+
+const STAGES = {
+  logic: runLogicStage,
+  view: runViewStage,
+  style: runStyleStage,
+}
+
+/** The compile stages, in the order the single-pass compile runs them. */
+export const STAGE_NAMES = Object.keys(STAGES)
+
+/**
+ * Run ONE stage's compile functions against whatever fs backend is already active
+ * (the fs shim for the memfs path, or native node:fs when this module is bundled
+ * without the fs alias for the Node disk pool). Assumes the env singletons are
+ * already restored (caller does `resetStoreInfo`). Threads `sourcemap` into all
+ * three stages: logic and view read a module-level flag (dmcc sets it from its
+ * worker message, which this path never sends), style takes it per call. Kept
+ * separate from `compileStage` so the Node stage worker can drive it directly with
+ * native fs, no shim.
+ * `sourcemapTargetPath` mirrors dmcc's own `sourcemapTargetPath: targetPath` worker
+ * message field: the FINAL published output dir (what `publishToDist` resolves,
+ * appId suffix included), used by logic's `writeCompileRes` to rebase `sources`
+ * against where the map actually ships, not the staging dir it compiles into. A
+ * caller that doesn't know the final dir yet (or doesn't care, sourcemap off) omits
+ * it and `__setEnableSourcemap` falls back to the staging dir, exactly like dmcc's
+ * own `targetPath || getTargetPath()`.
+ * @param {'logic'|'view'|'style'} stage
+ * @param {object} pages
+ * @param {{ sourcemap?: boolean, sourcemapTargetPath?: string|null }} [opts]
+ */
+export async function runStage(stage, pages, { sourcemap = false, sourcemapTargetPath = null } = {}) {
+  const run = STAGES[stage]
+  if (!run) throw new Error(`[compiler] unknown compile stage "${stage}" (expected ${STAGE_NAMES.join('/')})`)
+  let diagnostics = []
+  if (stage === 'view') {
+    const { validateProjectTemplates } = await import('./template-diagnostics.js')
+    diagnostics = validateProjectTemplates({ graph: getDependencyGraph().toJSON(), workPath: getWorkPath(),
+      templateExts: getTemplateExts(), scriptTags: getViewScriptTags(), pages })
+  }
+  if (stage === 'logic' || stage === 'view') {
+    (await loadStageModule(stage)).__setEnableSourcemap(!!sourcemap, sourcemapTargetPath)
+  }
+  await run(pages, makeProgress(), { sourcemap })
+  return diagnostics
+}
+
+/**
+ * `storeInfo` allocates the staging dir with `fs.mkdtempSync` under
+ * `GITHUB_WORKSPACE || os.tmpdir()`. That root exists on a real disk but not in
+ * an injected in-memory fs, where mkdtemp then fails with ENOENT. Create it in
+ * the injected fs first. This module is bundled with the same `node:os` /
+ * `node:process` aliases as the compiler's own env.js, so both sides resolve the
+ * same root (real tmpdir in the node build, '/tmp' in the browser build).
+ */
+function ensureStagingRoot(fs) {
+  const root = process.env.GITHUB_WORKSPACE || os.tmpdir()
+  fs.mkdirSync(root, { recursive: true })
+}
+
+// Directories that are not compile inputs. The project root stays an input:
+// it is the tree being compiled, not a subtree to skip.
+function compileInputRoots(workPath, roots, appIdDirWhenRoot) {
+  const project = path.resolve(workPath)
+  const out = []
+  for (const directory of roots) {
+    if (!directory) continue
+    const resolved = path.resolve(project, directory)
+    if (resolved === project) {
+      // The product of a build into the project itself is <project>/<appId>.
+      // Ignoring the project matches no child of the copy walk, and as an npm
+      // prefix it would skip the real root miniprogram_npm.
+      if (appIdDirWhenRoot) {
+        const product = path.resolve(project, getAppId())
+        if (product !== project) out.push(product)
+      }
+      continue
+    }
+    out.push(resolved)
+  }
+  return out
+}
+
+/**
+ * One-time setup against the injected fs: parse config/paths, scaffold the dist
+ * dir, compile app-config.json, build npm packages. Returns a SERIALIZABLE
+ * context (the storeInfo bundle + page map + ids + targetPath) that each stage
+ * restores via `compileStage`. Setup WRITES scaffolding/app-config/npm into the
+ * fs, so with a shared fs the stage workers read them without re-running setup.
+ * @param {{ fs: object, workPath?: string, options?: object, npmScanExclude?: string[] }} opts
+ *   npmScanExclude: absolute directory paths whose subtrees are not compile
+ *   inputs. The miniprogram_npm scan and the wasm/pag/mp4 copy both skip them.
+ *   Pass the publish outputDir when it can sit inside the project, so a previous
+ *   build's output is never re-ingested. The staging dir (getTargetPath) is
+ *   always excluded. An exclude that is the project root itself becomes
+ *   <project>/<appId> when appIdDirWhenRoot is set, which is where that
+ *   build writes.
+ * @returns {Promise<{ storeInfo: object, pages: object, appId: string, name: string, targetPath: string, workPath: string }>}
+ */
+export async function setupCompile({ fs, workPath = '/work', options = {}, npmScanExclude = [], appIdDirWhenRoot = true } = {}) {
+  assertFs(fs)
+  // Guarantee a usable appId regardless of whether the project declared one.
+  ensureAppIdFs(fs, `${workPath}/project.config.json`)
+  ensureStagingRoot(fs)
+  setFs(fs)
+  try {
+    const store = storeInfo(workPath, options)
+    createDist()
+    // storeInfo returns a snapshot. Copied binaries are recorded on a
+    // DependencyGraph, and later stages restore that updated snapshot.
+    const dependencyGraph = new DependencyGraph(store.dependencyGraph)
+    const inputRoots = compileInputRoots(getWorkPath(), [getTargetPath(), ...npmScanExclude], appIdDirWhenRoot)
+    compileConfig(dependencyGraph, { ignoredPaths: inputRoots })
+    store.dependencyGraph = dependencyGraph.toJSON()
+    // findMiniprogramNpmDirs() no-ops (existsSync guard, returns []) when there is
+    // no miniprogram_npm, so this only throws on a GENUINE npm build failure.
+    try {
+      await new ScopedNpmBuilder(getWorkPath(), getTargetPath(), {
+        fs,
+        excludeRoots: inputRoots,
+      }).buildNpmPackages()
+    } catch (e) {
+      throw new Error(`[compiler] miniprogram_npm build failed: ${e.message}`)
+    }
+    return {
+      storeInfo: store,
+      pages: getPages(),
+      appId: getAppId(),
+      name: getAppName(),
+      targetPath: getTargetPath(),
+      workPath,
+    }
+  } finally {
+    resetFs()
+  }
+}
+
+/**
+ * Run ONE compile stage against the injected fs. `pages` and `storeInfo` come
+ * from `setupCompile`. Self-contained: it points the fs shim at `fs` and restores
+ * the compiler env from the bundle, so it can run in a fresh worker realm.
+ * Products are written into `fs`.
+ * @param {{ stage: 'logic'|'view'|'style', pages: object, storeInfo: object, fs: object, sourcemap?: boolean, sourcemapTargetPath?: string|null }} opts
+ */
+export async function compileStage({ stage, pages, storeInfo: bundle, fs, sourcemap = false, sourcemapTargetPath = null } = {}) {
+  assertFs(fs)
+  setFs(fs)
+  try {
+    resetStoreInfo(bundle)
+    return await runStage(stage, pages, { sourcemap, sourcemapTargetPath })
+  } finally {
+    resetFs()
+  }
+}
+
+/**
+ * Collect the compiled products from the injected fs under `targetPath` into a
+ * `{ relPath: content }` map. Uses `fs` directly (no shim), so no setup needed.
+ * UTF-8 text comes back as a string; anything else (images and other binary assets
+ * the compiler copies into `main/static`) comes back as raw bytes.
+ * @param {{ fs: object, targetPath: string }} opts
+ * @returns {Record<string, string | Uint8Array>}
+ */
+export function collectOutputs({ fs, targetPath } = {}) {
+  return readOutputs(fs, targetPath)
+}
+
+/**
+ * Clear the compiler's module-level caches so a REUSED realm (e.g. a pooled
+ * worker kept warm to amortize wasm-toolchain init) can compile a second project
+ * without contamination from the first. The env singletons (pathInfo/configInfo)
+ * are overwritten by each setupCompile's storeInfo, so they need no clearing — but
+ * these caches are keyed by module/asset path with no appId qualifier and are
+ * otherwise never reset on the inline (non-worker) path:
+ *   - logic  processedModules — else a shared page path is skipped as "done"
+ *   - style  compileRes        — CSS cache
+ *   - view   compileResCache / wxsModuleRegistry / wxsFilePathMap
+ *   - assets assetsMap         — else a reused path returns a stale uuid and the
+ *                                asset copy into the new fs is skipped
+ * Call it BEFORE compiling the next project in the same realm.
+ */
+export function resetCompilerState() {
+  // Only stage modules that actually LOADED in this realm carry cache state; a stage
+  // that never loaded (lazy per-stage toolchains) has nothing to clear, and resetting
+  // must never force-load a toolchain this realm doesn't use. A module still mid-load
+  // is equally safe to skip: its caches are born empty.
+  const STAGE_RESETS = { logic: '__resetLogicState', view: '__resetViewState', style: '__resetStyleState' }
+  for (const [stage, mod] of stageModules) mod[STAGE_RESETS[stage]]()
+  __resetAssets()
+}
+
+// The compiler keeps module-level singletons (env.js pathInfo/configInfo) and the
+// fs shim has a single active backend, so two compiles in the same realm must NOT
+// overlap. Serialize calls through a promise chain — each waits for the previous
+// to settle. Cross-realm callers (separate workers/processes) are already isolated.
+let compileChain = Promise.resolve()
+
+/**
+ * Compile a mini-program against a caller-injected fs. Calls are serialized per
+ * realm (see the singleton note above). Convenience wrapper that runs
+ * `setupCompile` + all stages + `collectOutputs` in one realm.
+ * @param {{ fs: object, workPath?: string, options?: { fileTypes?: { template?: readonly string[], style?: readonly string[], viewScript?: readonly string[] } } }} opts
+ *   fs:       a node:fs replacement (sync subset: existsSync/readFileSync/
+ *             readdirSync{withFileTypes}/statSync/writeFileSync/mkdirSync{recursive}/
+ *             copyFileSync/rmSync), already seeded with the project source under
+ *             `workPath`. The compiler also writes products back into it, and a
+ *             missing project.config.json appid is written into it.
+ *   workPath: project root inside the fs, default '/work'.
+ *   options:  forwarded to `setupCompile` -> dmcc's `storeInfo` (custom file-type
+ *             dialect, e.g. { fileTypes: { template: ['altml'], style: ['altss'],
+ *             viewScript: ['alts'] } }).
+ * @returns {Promise<{ appId: string, name: string, files: Record<string, string | Uint8Array>, diagnostics: Array<{ source: string, line: number, column: number, endLine: number, endColumn: number, message: string, severity: 'warning'|'error' }> }>}
+ */
+export function compileMiniApp(opts = {}) {
+  const result = compileChain.then(() => runCompile(opts))
+  // Keep the chain alive regardless of this call's outcome; the caller still gets
+  // the real result/rejection via `result`.
+  compileChain = result.then(() => {}, () => {})
+  return result
+}
+
+async function runCompile({ fs, workPath = '/work', options = {} } = {}) {
+  const ctx = await setupCompile({ fs, workPath, options })
+  const { storeInfo: bundle, pages, appId, name, targetPath } = ctx
+  // Same order as the original single pass. Stages are independent (no product
+  // read-back), so the order is not load-bearing — the worker pool (pool.js) runs
+  // them concurrently in separate worker realms over a shared fs.
+  await compileStage({ stage: 'logic', pages, storeInfo: bundle, fs })
+  const diagnostics = await compileStage({ stage: 'view', pages, storeInfo: bundle, fs })
+  await compileStage({ stage: 'style', pages, storeInfo: bundle, fs })
+  return { appId, name, files: collectOutputs({ fs, targetPath }), diagnostics }
+}

@@ -1,0 +1,309 @@
+/**
+ * Compatibility test: verify that dimina-devtools WebSocket automation server
+ * speaks the miniprogram-automator protocol correctly.
+ *
+ * This proves that existing miniprogram-automator test scripts can connect
+ * to and drive our devtools.
+ */
+
+import { test, expect, _electron, type ElectronApplication, type Page as PwPage } from '@playwright/test'
+import path from 'path'
+import fs from 'fs'
+import { fileURLToPath } from 'url'
+import { WebSocket } from 'ws'
+import { createRequire } from 'module'
+import {
+  DEMO_APP_DIR,
+  openProjectInUI,
+  waitForSimulatorWebview,
+  closeProject,
+  ipcInvoke,
+  pollUntil,
+  evalInSimulator,
+  findMainWindow,
+} from './helpers'
+import { AutomationChannel } from '../src/shared/ipc-channels'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+// miniprogram-automator is CJS, need createRequire in ESM context
+const require = createRequire(import.meta.url)
+const automator = require('miniprogram-automator')
+
+// ── Shared state ──────────────────────────────────────────────────────
+
+let electronApp: ElectronApplication
+let mainWindow: PwPage
+let autoPort: number
+
+// ── WS helper ─────────────────────────────────────────────────────────
+
+function wsCall(method: string, params: Record<string, unknown> = {}): Promise<Record<string, unknown>> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${autoPort}`)
+    const timeout = setTimeout(() => { ws.close(); reject(new Error('timeout')) }, 10000)
+    ws.on('open', () => {
+      ws.send(JSON.stringify({ id: '1', method, params }))
+    })
+    ws.on('message', (data) => {
+      const msg = JSON.parse(String(data))
+      if (msg.id === '1') {
+        clearTimeout(timeout)
+        ws.close()
+        if (msg.error) reject(new Error(msg.error.message))
+        else resolve(msg.result as Record<string, unknown>)
+      }
+    })
+    ws.on('error', (err) => { clearTimeout(timeout); reject(err) })
+  })
+}
+
+// ── Setup / Teardown ──────────────────────────────────────────────────
+
+test.beforeAll(async () => {
+  const appPath = path.resolve(__dirname, 'electron-entry.js')
+  // Per-process user-data-dir so parallel workers don't clobber each other's
+  // Electron projects.json / settings (this spec self-launches and doesn't
+  // share the worker-scoped fixture).
+  const userDataDir = path.resolve(
+    __dirname, '..', 'node_modules', '.cache', 'devtools-e2e', 'userdata',
+    `compat-${process.pid}`,
+  )
+  fs.mkdirSync(userDataDir, { recursive: true })
+  electronApp = await _electron.launch({
+    args: [appPath, 'auto', '--auto-port', '0', `--user-data-dir=${userDataDir}`],
+    env: { ...process.env, NODE_ENV: 'test', DIMINA_E2E_USER_DATA_DIR: userDataDir },
+  })
+
+  mainWindow = await findMainWindow(electronApp)
+  await mainWindow.waitForLoadState('domcontentloaded')
+
+  await electronApp.evaluate(async ({ BrowserWindow }) => {
+    const win = BrowserWindow.getAllWindows()[0]
+    if (win && !win.isVisible()) {
+      await new Promise<void>((resolve) => { win.once('show', resolve); setTimeout(resolve, 5000) })
+    }
+    if (win) { win.setPosition(-2000, -2000); win.blur() }
+  })
+
+  autoPort = await pollUntil(
+    () => ipcInvoke<number | null>(mainWindow, AutomationChannel.GetPort),
+    (val) => typeof val === 'number' && val > 0,
+    10000,
+    100,
+  ) as number
+})
+
+test.afterAll(async () => {
+  await electronApp?.close().catch(() => {})
+})
+
+// ── Tests ─────────────────────────────────────────────────────────────
+
+test.describe('miniprogram-automator protocol compatibility', () => {
+  test.setTimeout(120_000)
+  test.describe.configure({ mode: 'serial' })
+
+  test('WS server accepts connection and responds to Tool.getInfo', async () => {
+    const result = await wsCall('Tool.getInfo')
+    expect(result).toHaveProperty('SDKVersion')
+    expect(result.SDKVersion).toBe('2.7.3')
+  })
+
+  test('unknown methods return error', async () => {
+    await expect(wsCall('NonExistent.method')).rejects.toThrow('Unknown method')
+  })
+
+  // The following tests open a project first
+  test.describe('with project open', () => {
+    test.beforeAll(async () => {
+      // Return value not captured — the rest of this block drives the app
+      // purely over the automation-protocol WebSocket, never a Page object.
+      await openProjectInUI(electronApp, DEMO_APP_DIR, { waitMs: 8000 })
+      await waitForSimulatorWebview(electronApp)
+
+      // NATIVE-HOST readiness gate. The page DOM is no longer in a same-document
+      // iframe of the simulator guest — each page is a cross-process render-host
+      // `.device-shell__webview` inside the DeviceShell. So instead of probing
+      // `iframe.contentDocument.querySelector('.page-title')` (which can never
+      // succeed under native-host), wait for DeviceShell to mount and spawn at
+      // least one render guest (the discriminators native-host-render.spec.ts
+      // asserts), then confirm the automation pipeline reports the live entry
+      // page. Once App.getCurrentPage answers, the active render guest is
+      // reachable and Page.getElement('.page-title') will resolve against it.
+      await pollUntil(
+        () => evalInSimulator<boolean>(
+          electronApp,
+          `(() => !!document.querySelector('.device-shell-root')
+              && document.querySelectorAll('.device-shell__webview').length >= 1)()`,
+        ).catch(() => false),
+        (ok) => ok === true,
+        25000,
+        300,
+      ).catch(() => {})
+      await pollUntil(
+        () => wsCall('App.getCurrentPage').catch(() => null),
+        (r) => !!r && typeof (r as { path?: string }).path === 'string'
+          && (r as { path: string }).path.includes('index/index'),
+        25000,
+        400,
+      ).catch(() => {})
+    })
+
+    test.afterAll(async () => {
+      await closeProject(electronApp).catch(() => {})
+    })
+
+    test('App.getPageStack returns stack', async () => {
+      const result = await wsCall('App.getPageStack')
+      const stack = result.pageStack as Array<{ pageId: number; path: string }>
+      expect(stack.length).toBeGreaterThanOrEqual(1)
+      expect(stack[stack.length - 1]!.path).toContain('index/index')
+    })
+
+    test('Element.getDOMProperties reads the page-title text', async () => {
+      // Element.getDOMProperties routes through evalInActivePage → the active
+      // render-host guest's main world (the guest IS the page document under
+      // native-host). We read `textContent` rather than `innerText`: the render
+      // guest is hosted by an offscreen WebContentsView, so `innerText` (which
+      // requires a laid-out/painted box) can resolve to '' there, whereas
+      // `textContent` is layout-independent and reliably carries the WXML text.
+      // This still proves getDOMProperties reaches the real page element and
+      // returns its content under native-host.
+      const el = await wsCall('Page.getElement', { selector: '.page-title', pageId: 1 })
+      const props = await wsCall('Element.getDOMProperties', {
+        elementId: el.elementId,
+        pageId: 1,
+        names: ['textContent'],
+      })
+      const properties = props.properties as string[]
+      expect(properties[0]).toContain('DevTools')
+    })
+
+    test('Element.getWXML returns HTML content', async () => {
+      const el = await wsCall('Page.getElement', { selector: '.page-title', pageId: 1 })
+      const inner = await wsCall('Element.getWXML', { elementId: el.elementId, pageId: 1, type: 'inner' })
+      expect(inner.wxml).toContain('DevTools')
+
+      const outer = await wsCall('Element.getWXML', { elementId: el.elementId, pageId: 1, type: 'outer' })
+      expect((outer.wxml as string)).toContain('page-title')
+    })
+
+    test('App.captureScreenshot returns PNG', async () => {
+      const result = await wsCall('App.captureScreenshot')
+      expect(result.data).toBeTruthy()
+      const buf = Buffer.from(result.data as string, 'base64')
+      expect(buf.length).toBeGreaterThan(100)
+      expect(buf[0]).toBe(0x89) // PNG magic
+    })
+
+    test('App.callWxMethod works for storage', async () => {
+      await wsCall('App.callWxMethod', {
+        method: 'setStorageSync',
+        args: ['compat_test_key', 'compat_test_value'],
+      })
+
+      const getResult = await wsCall('App.callWxMethod', {
+        method: 'getStorageSync',
+        args: ['compat_test_key'],
+      })
+      expect(getResult.result).toBe('compat_test_value')
+
+      // Cleanup
+      await wsCall('App.callWxMethod', {
+        method: 'removeStorageSync',
+        args: ['compat_test_key'],
+      })
+    })
+
+    test('unsupported methods return descriptive errors', async () => {
+      await expect(wsCall('Page.setData', { pageId: 1, data: {} }))
+        .rejects.toThrow('not supported')
+
+      await expect(wsCall('Page.callMethod', { pageId: 1, method: 'onLoad' }))
+        .rejects.toThrow('not supported')
+
+      await expect(wsCall('App.mockWxMethod', { method: 'test' }))
+        .rejects.toThrow('not supported')
+    })
+  })
+})
+
+// ── npm miniprogram-automator package smoke tests ─────────────────────
+//
+// These tests use the real miniprogram-automator npm package (not our SDK
+// wrapper) to verify that end-user automation scripts work against our
+// devtools. They run in a separate Electron instance on a different port
+// to keep them isolated from the protocol tests above.
+
+test.describe('npm miniprogram-automator package', () => {
+  test.setTimeout(120_000)
+  test.describe.configure({ mode: 'serial' })
+
+  let smokeElectronApp: ElectronApplication
+  let smokeMainWindow: PwPage
+  let smokePort: number
+  let miniProgram: Awaited<ReturnType<typeof automator.connect>>
+
+  test.beforeAll(async () => {
+    const appPath = path.resolve(__dirname, 'electron-entry.js')
+    const smokeUserDataDir = path.resolve(
+      __dirname, '..', 'node_modules', '.cache', 'devtools-e2e', 'userdata',
+      `compat-smoke-${process.pid}`,
+    )
+    fs.mkdirSync(smokeUserDataDir, { recursive: true })
+    smokeElectronApp = await _electron.launch({
+      args: [appPath, 'auto', '--auto-port', '0', `--user-data-dir=${smokeUserDataDir}`],
+      env: { ...process.env, NODE_ENV: 'test', DIMINA_E2E_USER_DATA_DIR: smokeUserDataDir },
+    })
+
+    smokeMainWindow = await findMainWindow(smokeElectronApp)
+    await smokeMainWindow.waitForLoadState('domcontentloaded')
+    await smokeElectronApp.evaluate(async ({ BrowserWindow }) => {
+      const win = BrowserWindow.getAllWindows()[0]
+      if (win) { win.setPosition(-2000, -2000); win.blur() }
+    })
+
+    smokePort = await pollUntil(
+      () => ipcInvoke<number | null>(smokeMainWindow, AutomationChannel.GetPort),
+      (val) => typeof val === 'number' && val > 0,
+      10000,
+      100,
+    ) as number
+
+    // Return value not captured — this block hands off to the npm
+    // `miniprogram-automator` package's own `automator.connect(wsEndpoint)`,
+    // never a Page object of ours.
+    await openProjectInUI(smokeElectronApp, DEMO_APP_DIR, { waitMs: 8000 })
+    await waitForSimulatorWebview(smokeElectronApp)
+    await new Promise((r) => setTimeout(r, 2000))
+
+    miniProgram = await automator.connect({
+      wsEndpoint: `ws://localhost:${smokePort}`,
+    })
+  })
+
+  test.afterAll(async () => {
+    if (miniProgram) {
+      miniProgram.disconnect()
+    }
+    await closeProject(smokeElectronApp).catch(() => {})
+    await smokeElectronApp?.close().catch(() => {})
+  })
+
+  test('automator.connect succeeds and currentPage returns index path', async () => {
+    const page = await miniProgram.currentPage()
+    expect(page.path).toContain('index/index')
+  })
+
+  test('callWxMethod round-trip works for storage', async () => {
+    await miniProgram.callWxMethod('setStorageSync', 'auto_test_k', 'auto_test_v')
+
+    const val = await miniProgram.callWxMethod('getStorageSync', 'auto_test_k')
+    expect(val).toBe('auto_test_v')
+
+    await miniProgram.callWxMethod('removeStorageSync', 'auto_test_k')
+    const removed = await miniProgram.callWxMethod('getStorageSync', 'auto_test_k')
+    expect(removed).toBe('')
+  })
+})

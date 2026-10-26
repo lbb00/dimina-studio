@@ -1,0 +1,18 @@
+{
+  "app": {
+    "entryPagePath": "pages/index/index",
+    "pages": ["pages/index/index"],
+    "window": {
+      "navigationBarTitleText": "HostBgSpawn",
+      "navigationBarBackgroundColor": "#ffffff",
+      "navigationBarTextStyle": "black",
+      "navigationStyle": "default"
+    }
+  },
+  "modules": {
+    "pages/index/index": {
+      "navigationBarTitleText": "Home",
+      "root": "main"
+    }
+  }
+}

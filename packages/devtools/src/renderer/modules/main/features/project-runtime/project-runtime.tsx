@@ -1,0 +1,489 @@
+import { useCallback, useEffect, useMemo, useRef, useState, type MutableRefObject, type ReactNode } from 'react'
+import { COPY_FEEDBACK_TIMEOUT_MS, MIN_PANEL_VIEWPORT_HEIGHT, MIN_PANEL_WIDTH_PX } from '@/shared/constants'
+import {
+  getBranding,
+  onHostToolbarHeightChanged,
+  getHostToolbarHeight,
+  openInternalDevtools,
+} from '@/shared/api'
+import type { Project } from '@/shared/types'
+import { useProjectRuntimeController } from './controllers/use-project-runtime-controller'
+import { useLayoutStore } from './controllers/use-layout-store'
+import { useEditorPanelActivation } from './controllers/use-editor-panel-activation'
+import { ProjectToolbar } from './components/project-toolbar'
+import { SimulatorPanel } from './components/simulator-panel'
+import { EditorPanel } from './components/editor-panel'
+import { DebugTabContent } from '../bottom-debug-panel/bottom-debug-panel'
+import type { BottomDebugPanelProps, DebugTabContentId } from '../bottom-debug-panel/bottom-debug-panel'
+import { createViewAnchor } from 'view-anchor'
+import type { Placement, ViewAnchorHandle } from 'view-anchor'
+import { useViewAnchor } from 'view-anchor/react'
+import { VIEW_ID, VIEW_LAYER } from '../../../../../shared/view-ids'
+import { compileModeLabel } from '../../../../../shared/compile-modes'
+import { selectedMode } from '../../../../../shared/compile-mode-state'
+import { PlacementPublisherContext, usePlacementPublisher } from '@/shared/placement-publisher-context'
+import { useHostSlotExtent, useScreenPlacementPublisher } from '@/shared/host-slot-hooks'
+import { DockView } from 'electron-deck/dock-react'
+import { serializeLayout, setConstraint, closePanelForUser } from 'electron-deck/layout'
+import { constraintAt, constraintMinPxAt, findSimulatorConstraintSite, withSimulatorFloor } from './layout/simulator-constraint'
+import type { LayoutModel, PanelRegistry } from 'electron-deck/layout'
+import {
+  buildDockModel,
+  buildDockRegistry,
+} from './layout/dock-layout'
+
+// The seven dock panels after splitting the coarse `debug` into five fine ones.
+// `console` is the only native overlay; the rest are DOM panels (simulator +
+// editor own their own WCV anchors inside their DOM bodies).
+const DOCK_PANEL_IDS = new Set([
+  'simulator',
+  'editor',
+  'wxml',
+  'appdata',
+  'storage',
+  'console',
+  'compile',
+])
+
+interface ProjectRuntimeProps {
+  project: Project
+}
+
+/**
+ * The project window's main content area.
+ *
+ * Layout is the layout-engine `<DockView>`, owned entirely by the
+ * `<DockableLayout>` child below: simulator (DOM panel owning its WCV anchor) +
+ * editor (DOM panel owning the workbench WCV anchor) + the five debug panels
+ * (wxml/appdata/storage/console/compile, with console a native overlay). The
+ * dock tree is persisted opaquely via the layout store; `dock-layout.ts` seeds
+ * the default arrangement on a fresh install. Simulator + editor own their own
+ * WCV anchors in `SimulatorPanel`/`EditorPanel`; only the console native-overlay
+ * bounds-sync lives inside `DockableLayout` via `createViewAnchor`.
+ */
+export function ProjectRuntime({ project }: ProjectRuntimeProps) {
+  const copyTimerRef = useRef<number | null>(null)
+  const [copied, setCopied] = useState(false)
+
+  const controller = useProjectRuntimeController({ projectPath: project.path })
+  const { session, device, simulator, panelData, rightPane, popover } = controller
+
+  const layout = useLayoutStore(project.path)
+  const { state: layoutState } = layout
+
+  // Dock model + registry are owned HERE (lifted out of DockableLayout) so the
+  // toolbar's Panels visibility menu and the DockView render from ONE shared
+  // model. ProjectRuntime is keyed on `project.path` at its mount site
+  // (main.tsx), so this `useState` initializer rebuilds the model per project —
+  // seeding from the persisted tree once, exactly as DockableLayout did before.
+  const [dockModel] = useState(() =>
+    buildDockModel(layoutState.dockTree ?? null, device.simPanelWidth, DOCK_PANEL_IDS),
+  )
+
+  // The 'editor' dock slot is the embedded workbench (a DOM panel owning its
+  // WCV anchor); the registry never changes across the component's life.
+  const dockRegistry = useMemo(() => buildDockRegistry(), [])
+
+  const publisher = useScreenPlacementPublisher()
+
+  const { panelActivation, requestPanelActivation } = useEditorPanelActivation(dockModel, device.simPanelWidth)
+
+  // Host-controllable toolbar WCV (sits above ProjectToolbar). Dynamic-height
+  // loop: the toolbar WCV's own renderer advertises its intrinsic content
+  // height (reverse size-advertiser) → main pushes it here as
+  // `HostToolbarHeightChanged` → we resize the placeholder div below → the
+  // forward anchor re-measures → main re-overlays the WCV. `present` is
+  // height > 0 (a height of 0 means the host registered no toolbar, so we emit
+  // ZERO and the WCV is collapsed). `deps` carries the height so the anchor
+  // re-publishes when the placeholder's rect changes. Seeded at 0: unlike the
+  // sidebar, nothing loads default content into this slot, so "absent until a
+  // host fills it" is the truth.
+  const hostToolbarHeight = useHostSlotExtent(
+    0,
+    onHostToolbarHeightChanged,
+    getHostToolbarHeight,
+  )
+  // Forward anchor for the host-toolbar strip. useViewAnchor publishes a Bounds
+  // (ZERO when absent); map it to a discriminated Placement written to the
+  // central publisher (host-toolbar sits above the base row via its layer).
+  const hostToolbarAnchorRef = useViewAnchor({
+    visible: hostToolbarHeight > 0,
+    treatZeroAreaAsHidden: true,
+    publish: (placement) => {
+      publisher.set({
+        viewId: VIEW_ID.hostToolbar,
+        placement,
+        layer: VIEW_LAYER.hostToolbar,
+      })
+    },
+    deps: [hostToolbarHeight, publisher],
+  })
+
+  useEffect(() => {
+    let appName = 'Dimina DevTools'
+    document.title = `${project.name} - ${appName}`
+    getBranding()
+      .then((result) => {
+        if (result?.appName) {
+          appName = result.appName
+          document.title = `${project.name} - ${appName}`
+        }
+      })
+      .catch(() => {})
+    return () => {
+      document.title = appName
+    }
+  }, [project.name])
+
+  useEffect(() => {
+    return () => {
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current)
+      }
+    }
+  }, [])
+
+  async function copyPagePath() {
+    if (!simulator.currentRoute) return
+    try {
+      // Copy the displayed route (page + params) so a shared/traced route
+      // reproduces the page's launch state, matching what the bar shows.
+      await navigator.clipboard.writeText(simulator.currentRoute)
+      setCopied(true)
+      if (copyTimerRef.current !== null) {
+        window.clearTimeout(copyTimerRef.current)
+      }
+      copyTimerRef.current = window.setTimeout(() => setCopied(false), COPY_FEEDBACK_TIMEOUT_MS)
+    } catch {
+      setCopied(false)
+    }
+  }
+
+  // Shared debug-panel data + handlers. The dockable `renderDomPanel` forwards
+  // them through DebugTabContent so each of the four DOM debug tabs drives the
+  // same handlers.
+  const debugPanelProps: BottomDebugPanelProps = {
+    rightPane: rightPane.rightPane,
+    onSelectTab: rightPane.selectRightPane,
+    wxmlSource: panelData.wxmlSource,
+    wxmlEnabled: panelData.wxmlEnabled,
+    storageSource: panelData.storageSource,
+    storageEnabled: panelData.storageEnabled,
+    appDataSource: panelData.appDataSource,
+    appDataEnabled: panelData.appDataEnabled,
+    activePagePath: simulator.currentPage,
+    compileEvents: session.compileEvents,
+    compileLogs: session.compileLogs,
+    onClearCompileEvents: session.clearCompileEvents,
+    // Distinguishes "小程序未运行" from a true empty-data vacuum in the debug
+    // panels' empty states — non-running includes null (never reported yet).
+    isRuntimeRunning: session.runtimeStatus?.phase === 'running',
+  }
+
+  // DOM-panel renderer for DockView. `simulator` renders the SimulatorPanel
+  // chrome (device/zoom pickers, compile overlays, page-path bar); SimulatorPanel
+  // owns the simulator WCV anchor on its device-region div (a bare native slot
+  // would render no chrome). `editor` renders EditorPanel, a full-size anchor div
+  // owning the workbench WCV placement. The four React debug tabs
+  // (wxml/appdata/storage/compile) render through DockDebugTab. The native
+  // `console` slot is routed to a NativeSlot by DockView, never here. A plain
+  // function (not useCallback): `debugPanelProps` is rebuilt every render with
+  // fresh handlers, so memoizing would only pin stale nodes; DockView re-reads it
+  // on each render anyway.
+  const renderDomPanel = (panelId: string, opts: { active: boolean }): ReactNode => {
+    if (panelId === 'simulator') {
+      return (
+        <SimulatorPanel
+          device={device.device}
+          zoom={device.zoom}
+          onOpenDevicePicker={device.openDevicePicker}
+          onZoomChange={device.handleZoomChange}
+          compileStatus={session.compileStatus}
+          currentPage={simulator.currentRoute}
+          copied={copied}
+          onCopyPagePath={copyPagePath}
+          runtimeStatus={session.runtimeStatus}
+          watcherDead={session.watcherDead}
+          onRelaunch={() => session.relaunch()}
+          onOpenInternalDevtools={() => { void openInternalDevtools() }}
+        />
+      )
+    }
+    if (panelId === 'editor') {
+      return <EditorPanel />
+    }
+    if (
+      panelId === 'wxml' ||
+      panelId === 'appdata' ||
+      panelId === 'storage' ||
+      panelId === 'compile'
+    ) {
+      // DOCK path (keepalive): `renderActiveBody` keeps ALL DOM debug tabs
+      // mounted, so the `DockDebugTab` is NOT remounted on a tab switch. It fires
+      // the per-tab refresh off the `active` false→true edge (M3) — the dock tab
+      // strip drives activation through the model and never calls a
+      // `handleSelectTab`.
+      return <DockDebugTab tabId={panelId} active={opts.active} panelProps={debugPanelProps} />
+    }
+    return null
+  }
+
+  return (
+    <PlacementPublisherContext.Provider value={publisher}>
+    <div className="flex flex-col h-screen">
+      {/*
+        Placeholder reserving space for the host-controllable toolbar WCV. Its
+        bounds are published to main via the forward anchor; its height is
+        driven by the WCV's advertised intrinsic height (see hostToolbarHeight
+        above). The flex-col root pushes everything below down automatically —
+        no offset math anywhere.
+      */}
+      <div
+        ref={hostToolbarAnchorRef}
+        style={{ height: hostToolbarHeight }}
+        className="shrink-0 w-full"
+        data-area="host-toolbar"
+      />
+      <ProjectToolbar
+        compileDropdownRef={popover.compileDropdownRef}
+        showCompilePanel={popover.showCompilePanel}
+        onToggleCompilePanel={popover.toggleCompilePanel}
+        compileModeLabel={compileModeLabel(selectedMode(session.compileModes))}
+        compileModesReady={session.compileModesReady}
+        onRelaunch={() => session.relaunch()}
+        compileStatus={session.compileStatus}
+        dockModel={dockModel}
+        dockRegistry={dockRegistry}
+        layout={layout}
+        simPanelWidth={device.simPanelWidth}
+        onPanelOpened={requestPanelActivation}
+      />
+
+      <div className="flex-1 min-h-0 overflow-hidden">
+        {/*
+          The dock layout is the SOLE layout. DockableLayout owns all dock state
+          and builds its model synchronously on mount, so DockView renders on the
+          first commit. Keying on `project.path` remounts it on a project switch
+          so the new project's persisted tree seeds a fresh model.
+        */}
+        <DockableLayout
+          dockModel={dockModel}
+          dockRegistry={dockRegistry}
+          simPanelWidth={device.simPanelWidth}
+          renderDomPanel={renderDomPanel}
+          onPersistTree={layout.setDockTree}
+          persistedTree={layoutState.dockTree ?? null}
+          panelActivation={panelActivation}
+        />
+      </div>
+    </div>
+    </PlacementPublisherContext.Provider>
+  )
+}
+
+interface DockableLayoutProps {
+  /** The shared dock model, built + owned by ProjectRuntime. */
+  dockModel: LayoutModel
+  /** The shared panel registry, built + owned by ProjectRuntime. */
+  dockRegistry: PanelRegistry
+  /**
+   * Current device pixel width. Re-pins the simulator's fixed-px leaf live on a
+   * device change (the picker changes width without a remount — without this the
+   * simulator leaf would keep the old device width).
+   */
+  simPanelWidth: number
+  /** DOM-panel renderer for simulator/editor/debug bodies (console is the only
+   * native panel → routed to a NativeSlot, never through this). */
+  renderDomPanel: (panelId: string, opts: { active: boolean }) => ReactNode
+  /** Persist DockView's in-session layout mutations (opaque serialized tree). */
+  onPersistTree: (serialized: string) => void
+  /**
+   * The RAW persisted tree string the model was seeded from (or null on a fresh
+   * install). Used ONLY for the mount-time force-persist: `buildDockModel` heals
+   * a flexible child collapsed to a ~0 weight, but that healing lives in the
+   * model's INITIAL state and fires no `subscribe` emission — so without a
+   * compare-on-mount the stale 0-weight string would survive in localStorage and
+   * re-collapse the panel next launch. When the model's current serialization
+   * differs from this, we persist the healed value once.
+   */
+  persistedTree: string | null
+  panelActivation: { panelId: string; epoch: number } | undefined
+}
+
+/**
+ * The dock layout — the SOLE project-window layout.
+ *
+ * The model is built SYNCHRONOUSLY in `useState`'s initializer so `<DockView>`
+ * renders on the very first commit. The only native overlay this component owns
+ * is the CONSOLE; the simulator and editor WCV anchors live in their own DOM
+ * panels (`SimulatorPanel`/`EditorPanel`). The simulator's device-width pin is
+ * kept live via `setConstraint` on a device change.
+ */
+/**
+ * Dock-mode wrapper for a DOM debug tab. Under DOM-panel KEEPALIVE every debug
+ * tab body stays MOUNTED (inactive ones hidden), so this component is NOT
+ * remounted on a tab switch — its `active` prop flips instead, forwarded here
+ * as `tabActive`. WXML's, Storage's and AppData's activation-edge seed AND
+ * visibility gate all live in the shared ConnectedWxmlPanel /
+ * ConnectedStoragePanel / ConnectedAppDataPanel, driven by that prop —
+ * `'compile'` is push-fed (projectStatus + compileLog) and needs no seed at
+ * all — so this wrapper does no refresh bookkeeping of its own.
+ */
+function DockDebugTab(
+  { tabId, active, panelProps }: { tabId: DebugTabContentId; active: boolean; panelProps: BottomDebugPanelProps },
+): ReactNode {
+  return <DebugTabContent tabId={tabId} {...panelProps} tabActive={active} />
+}
+
+function DockableLayout(props: DockableLayoutProps): ReactNode {
+  const { dockModel, dockRegistry, simPanelWidth, renderDomPanel, onPersistTree, persistedTree, panelActivation } = props
+
+  // Native CONSOLE overlay (the simulator's Chromium DevTools WebContentsView).
+  // Its bounds ride a SEPARATE channel (`publishSimulatorDevtoolsBounds`) from
+  // the simulator device WCV (which `SimulatorPanel` owns). `treatZeroAreaAsHidden`
+  // is on: when the console tab is inactive the slot is display:none, which must
+  // DETACH the overlay (publish hidden) rather than overlay a 0×0 rect over live
+  // content. Console is the ONLY native dock panel — simulator and editor are DOM
+  // panels owning their own WCV anchors (`SimulatorPanel`/`EditorPanel`), so
+  // `bindNativeSlot` only fires for console and a simulator/editor branch here
+  // would be dead code.
+  const consoleAnchorRef = useRef<ViewAnchorHandle | null>(null)
+  const placementPublisher = usePlacementPublisher()
+  // Console overlay placement flows to the central publisher (discriminated
+  // Placement kept end-to-end — a hidden console publishes { visible:false },
+  // never a 0×0 rect).
+  const publishConsole = useCallback((p: Placement) => {
+    placementPublisher?.set({
+      viewId: VIEW_ID.simulatorDevtools,
+      placement: p,
+      layer: VIEW_LAYER.base,
+    })
+  }, [placementPublisher])
+
+  // Bind/rebind/release the console native-overlay anchor for `el`. The overlay
+  // needs display:none detach (an inactive tab releases the WCV), `followScroll`
+  // (track ancestor scroll), AND `followGeometry`: a drag-re-dock can MOVE the
+  // slot without resizing it, and a ResizeObserver never fires on a pure
+  // translate, so the geometry sentinel re-publishes the rect.
+  const bindOverlayAnchor = useCallback(
+    (
+      ref: MutableRefObject<ViewAnchorHandle | null>,
+      el: HTMLElement | null,
+      publish: (p: Placement) => void,
+    ) => {
+      if (ref.current) {
+        if (el) {
+          ref.current.dispose()
+          ref.current = createViewAnchor(el, {
+            visible: true,
+            treatZeroAreaAsHidden: true,
+            followScroll: true,
+            followGeometry: true,
+            publish,
+          })
+        } else {
+          ref.current.update({ visible: false, publish })
+          ref.current.dispose()
+          ref.current = null
+        }
+        return
+      }
+      if (el) {
+        ref.current = createViewAnchor(el, {
+          visible: true,
+          treatZeroAreaAsHidden: true,
+          followScroll: true,
+          followGeometry: true,
+          publish,
+        })
+      }
+    },
+    [],
+  )
+
+  const bindNativeSlot = useCallback(
+    (panelId: string, el: HTMLElement | null) => {
+      if (panelId === 'console') {
+        bindOverlayAnchor(consoleAnchorRef, el, publishConsole)
+      }
+    },
+    [bindOverlayAnchor, publishConsole],
+  )
+
+  // Live device-width re-pin: the simulator column's `minPx` FLOOR must follow
+  // the device width. On a device change the picker updates `simPanelWidth`
+  // without a remount, so re-pin the simulator's `minPx` constraint in the model.
+  // Skip when the floor already equals `simPanelWidth` (no redundant emission, N1)
+  // or when the simulator isn't min-px floored (a re-dock moved it out).
+  useEffect(() => {
+    const root = dockModel.get().root
+    const site = findSimulatorConstraintSite(root)
+    if (!site) return
+    if (constraintMinPxAt(root, site) === simPanelWidth) return
+    dockModel.apply((t) => {
+      const cur = findSimulatorConstraintSite(t.root)
+      if (!cur) return t
+      if (constraintMinPxAt(t.root, cur) === simPanelWidth) return t
+	  return setConstraint(t, cur.splitId, cur.childIndex, withSimulatorFloor(constraintAt(t.root, cur), simPanelWidth))
+    })
+  }, [dockModel, simPanelWidth])
+
+  // Dispose the console anchor on unmount (the slot's `null` cleanup also
+  // disposes, but a hard unmount of the whole component must not leak it).
+  useEffect(() => {
+    return () => {
+      consoleAnchorRef.current?.dispose()
+      consoleAnchorRef.current = null
+      placementPublisher?.remove(VIEW_ID.simulatorDevtools)
+    }
+  }, [placementPublisher])
+
+  // Persist DockView's in-session layout mutations back to the store.
+  useEffect(() => {
+    const unsub = dockModel.subscribe((snap) => {
+      onPersistTree(serializeLayout(snap.tree))
+    })
+    return unsub
+  }, [dockModel, onPersistTree])
+
+  // Force-persist a HEALED tree on mount. `buildDockModel` runs
+  // `sanitizeFlexibleWeights` on the restored tree (lifting a flexible child
+  // collapsed to a ~0 weight), but that healing is the model's INITIAL state and
+  // fires no `subscribe` emission — so the stale 0-weight string would otherwise
+  // survive in localStorage and re-collapse the panel on the next launch. If the
+  // model's current serialization differs from the raw persisted string, write
+  // the healed value back ONCE (mount-only: deps are empty so a later in-session
+  // mutation goes through the subscribe path above, not here).
+  useEffect(() => {
+    const current = serializeLayout(dockModel.get())
+    if (current !== persistedTree) onPersistTree(current)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Clicking an already-active tab closes that panel (removes it from the
+  // tree). Structural panels (simulator/editor) are protected. Routes through
+  // `closePanelForUser` so the registry's `closable` capability is the single
+  // authority: a `closable:false` panel (the debug tabs) is never removed by an
+  // active-tab click, matching the gated `×` affordance. Closed panels can be
+  // reopened from the toolbar Panels menu.
+  const handleActiveTabClick = useCallback(
+    (panelId: string) => {
+      if (panelId === 'simulator' || panelId === 'editor') return
+      dockModel.apply((t) => closePanelForUser(t, panelId, dockRegistry))
+    },
+    [dockModel, dockRegistry],
+  )
+
+  return (
+    <DockView
+      model={dockModel}
+      registry={dockRegistry}
+      renderDomPanel={renderDomPanel}
+      bindNativeSlot={bindNativeSlot}
+      onActiveTabClick={handleActiveTabClick}
+      minimumViewportHeight={MIN_PANEL_VIEWPORT_HEIGHT}
+      minimumViewportWidth={MIN_PANEL_WIDTH_PX}
+      panelActivation={panelActivation}
+    />
+  )
+}

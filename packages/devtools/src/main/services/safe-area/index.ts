@@ -1,0 +1,169 @@
+import type { WebContents } from 'electron'
+import type { ConnectionRegistry } from 'electron-deck/main'
+import type { NativeDeviceInfo } from '../../../shared/ipc-channels.js'
+import { createCdpSessionBroker, type CdpSessionBroker, type CdpSessionLease } from '../cdp-session/index.js'
+
+/**
+ * CSS `env(safe-area-inset-*)` simulation for render-host `<webview>` guests.
+ *
+ * Desktop Chromium has no physical notch, so a mini-program page laid out
+ * edge-to-edge sees `env(safe-area-inset-*) = 0`. We override it per device via
+ * the CDP `Emulation.setSafeAreaInsetsOverride` command (verified on Electron 41
+ * / Chromium 146 — it drives `env(safe-area-inset-*)` directly and works on a
+ * `<webview>` guest). Driven from `did-attach-webview` so the value resolves
+ * before the page paints.
+ *
+ * The TOP inset is per navigation STYLE, matching what dimina's native
+ * containers lay out:
+ *   - default navigation bar → the shell draws the nav bar, which already
+ *     covers the notch, and the guest starts below it → TOP 0. Surfacing the
+ *     device inset here would push the page content down a second time.
+ *   - custom navigation bar → the guest is full-bleed to the device top and
+ *     borders the unsafe zone itself → the real TOP inset.
+ * The BOTTOM inset always comes from the device. A render WebView exposes the
+ * same bottom `env(safe-area-inset-bottom)` for a device whether or not it is
+ * a tab page. The navigation style comes from the attaching guest's render-host
+ * URL (`navStyle`), read in view-manager's `will-attach-webview`.
+ * (See docs/simulator-render-architecture.md.)
+ */
+
+/** The 8-field CDP `SafeAreaInsets` shape (base + *Max). Omitting `*Max` leaves
+ *  `env(safe-area-max-inset-*)` at 0, so mirror base→max. */
+interface CdpSafeAreaInsets {
+  top: number
+  topMax: number
+  right: number
+  rightMax: number
+  bottom: number
+  bottomMax: number
+  left: number
+  leftMax: number
+}
+
+/** What the guest's own page contributes to the inset policy: whether the
+ *  shell draws a navigation bar over the notch for it. */
+export interface GuestPageInsetPolicy {
+  isCustomNav: boolean
+}
+
+/**
+ * Read a guest's inset policy off its render-host URL (`navStyle`, written by
+ * `buildRenderHostDocumentUrl`). An unparseable URL degrades to the default-nav
+ * policy rather than failing the attach.
+ */
+export function parseGuestPageInsetPolicy(src: string): GuestPageInsetPolicy {
+  try {
+    const params = new URL(src).searchParams
+    return { isCustomNav: params.get('navStyle') === 'custom' }
+  } catch {
+    return { isCustomNav: false }
+  }
+}
+
+function guestInsets(device: NativeDeviceInfo | null, page: GuestPageInsetPolicy): CdpSafeAreaInsets {
+  // Only a custom-nav (full-bleed) page borders the unsafe top zone; a
+  // default-nav page already starts below the shell nav bar, which covers the
+  // notch itself.
+  const top = page.isCustomNav ? (device?.safeAreaInsets.top ?? 0) : 0
+  const bottom = device?.safeAreaInsets.bottom ?? 0
+  // Left/right come straight from the device (e.g. a landscape Dynamic Island
+  // rotates into a side notch) — unlike top they don't depend on page
+  // type, since neither shell chrome nor the tabBar reserves horizontal space.
+  const right = device?.safeAreaInsets.right ?? 0
+  const left = device?.safeAreaInsets.left ?? 0
+  return { top, topMax: top, right, rightMax: right, bottom, bottomMax: bottom, left, leftMax: left }
+}
+
+export interface SafeAreaController {
+  /** Attach the debugger to a freshly-attached render-host guest and push the
+   *  current device's insets. `page` selects the top policy (real inset only for
+   *  a custom-nav page); the bottom inset always comes from the device. No-op
+   *  (warn) if the guest is already claimed by an external CDP client — env
+   *  then stays 0. */
+  applyToGuest(guestWc: WebContents, device: NativeDeviceInfo | null, page: GuestPageInsetPolicy): void
+  /** Re-push insets to every still-attached guest after a device change (each
+   *  guest keeps the page policy it attached with). */
+  reapplyAll(device: NativeDeviceInfo | null): void
+  /** Release this controller's session leases (teardown). Does not itself
+   *  detach the shared debugger session — see cdp-session/index.ts. */
+  dispose(): void
+}
+
+export function createSafeAreaController(options: { connections?: ConnectionRegistry, broker?: CdpSessionBroker } = {}): SafeAreaController {
+  // Own (and dispose on this controller's own dispose()) a private broker
+  // only when the caller didn't supply a shared one.
+  const ownsBroker = !options.broker
+  // The shared CDP session broker (see cdp-session/index.ts) — reused across
+  // safe-area/elements-forward/render-inspect/network-forward when the caller
+  // passes one; falls back to a private instance so this module stays
+  // independently testable/usable.
+  const broker = options.broker ?? createCdpSessionBroker({ connections: options.connections })
+
+  // Each guest's page policy, fixed for its life — tracked SEPARATELY from the
+  // lease so a lost session (external detach) doesn't lose the policy: a
+  // later `override`/`reapplyAll` can reacquire and keep applying the same
+  // policy this guest attached with.
+  const pageType = new Map<WebContents, GuestPageInsetPolicy>()
+  // Current lease per guest, if any. Cleared (not just left stale) on
+  // `lease.onDetach` — an external detach or a real Chrome DevTools window
+  // stealing the session — so the next `override` reacquires instead of
+  // sending through a dead lease forever.
+  const leases = new Map<WebContents, CdpSessionLease>()
+
+  /** Get-or-reacquire this guest's lease. Null when the session is unavailable. */
+  function ensureLease(wc: WebContents): CdpSessionLease | null {
+    const existing = leases.get(wc)
+    if (existing) return existing
+    const lease = broker.acquire(wc)
+    if (!lease) return null
+    leases.set(wc, lease)
+    lease.onDetach(() => { leases.delete(wc) })
+    return lease
+  }
+
+  function override(wc: WebContents, device: NativeDeviceInfo | null, page: GuestPageInsetPolicy): void {
+    if (wc.isDestroyed()) return
+    const lease = ensureLease(wc)
+    if (!lease) {
+      // Exclusively held elsewhere (e.g. a real Chrome DevTools window via
+      // --remote-debugging-port). Degrade: leave env at 0 rather than fail
+      // the page.
+      console.warn('[safe-area] debugger session unavailable; env(safe-area-inset-*) stays 0')
+      return
+    }
+    void lease
+      .send('Emulation.setSafeAreaInsetsOverride', { insets: guestInsets(device, page) })
+      .catch((err: unknown) => {
+        console.warn('[safe-area] setSafeAreaInsetsOverride failed:', err instanceof Error ? err.message : err)
+      })
+  }
+
+  return {
+    applyToGuest: (wc, device, page) => {
+      if (!wc || wc.isDestroyed()) return
+      const isFirstTime = !pageType.has(wc)
+      pageType.set(wc, page)
+      if (isFirstTime) {
+        const forget = (): void => { pageType.delete(wc); leases.delete(wc) }
+        if (options.connections) {
+          options.connections.acquire(wc).own(forget)
+        } else {
+          wc.once('destroyed', forget)
+        }
+      }
+      override(wc, device, page)
+    },
+    reapplyAll: (device) => {
+      for (const [wc, page] of pageType) override(wc, device, page)
+    },
+    dispose: () => {
+      // Release our leases only — the shared session's actual detach is the
+      // broker's own top-level dispose() to decide (another consumer may
+      // still be using it).
+      for (const lease of leases.values()) lease.dispose()
+      leases.clear()
+      pageType.clear()
+      if (ownsBroker) broker.dispose()
+    },
+  }
+}

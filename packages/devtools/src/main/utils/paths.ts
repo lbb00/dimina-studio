@@ -1,0 +1,114 @@
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
+import type { RuntimeContext } from '@dimina-studio/electron-runtime/main/runtime-context'
+
+// Hardcoded relative jumps like '../../dist/renderer' break under the
+// esbuild single-file bundle (dist/main/index.bundle.js): every inlined
+// module ends up at the bundle's depth instead of its tsc location, so
+// the math goes off by a directory. Walk up to this package's own
+// package.json so the resolver works for tsc multi-file, the bundle,
+// npm/pnpm node_modules, and asar packaging alike.
+function resolveDevtoolsPackageRoot(): string {
+  let dir = path.dirname(fileURLToPath(import.meta.url))
+  const root = path.parse(dir).root
+  while (dir !== root) {
+    const pkgPath = path.join(dir, 'package.json')
+    try {
+      const pkg = JSON.parse(fs.readFileSync(pkgPath, 'utf8')) as { name?: string }
+      if (pkg.name === '@dimina-studio/devtools') return dir
+    } catch {}
+    dir = path.dirname(dir)
+  }
+  throw new Error('@dimina-studio/devtools package root not found from ' + fileURLToPath(import.meta.url))
+}
+
+export const devtoolsPackageRoot = resolveDevtoolsPackageRoot()
+
+export const rendererDir = path.join(devtoolsPackageRoot, 'dist/renderer')
+
+export const defaultPreloadPath = path.join(devtoolsPackageRoot, 'dist/preload/windows/simulator.js')
+
+/**
+ * Resolve the CommonJS sibling (`*.cjs`) of a simulator preload bundle.
+ *
+ * A `<webview>`/session-frame preload is always loaded as CommonJS by Electron.
+ * The native-host simulator (the sole runtime) instead runs in a top-level
+ * WebContentsView whose `webPreferences.preload` obeys the `.js` +
+ * `"type":"module"` ESM rule — so the `.js` bundle would fail with
+ * `require is not defined`. We ship a byte-identical `.cjs` copy
+ * (build:preload emits both) and hand the WCV the `.cjs` sibling. If a host
+ * supplies a custom `.js` preload, we swap the extension; an already-`.cjs`
+ * path (or any non-`.js`) is returned unchanged.
+ */
+export function cjsSiblingPreloadPath(preloadPath: string): string {
+  return preloadPath.endsWith('.js')
+    ? preloadPath.slice(0, -'.js'.length) + '.cjs'
+    : preloadPath
+}
+
+/**
+ * Preload bundle for the main window, settings window, and the settings /
+ * popover overlay WebContentsViews. Exposes `window.devtools.ipc` via
+ * contextBridge so the renderer never needs `window.require('electron')`.
+ */
+export const mainPreloadPath = path.join(devtoolsPackageRoot, 'dist/preload/windows/main.cjs')
+
+/**
+ * Session-registered toolbar-runtime preload bundle (the reverse
+ * size-advertiser, self-guarded by the `--dimina-host-toolbar` marker +
+ * `isMainFrame`). Registered on `session.defaultSession` via
+ * `registerPreloadScript({ type: 'frame', filePath })` — see
+ * `src/main/services/views/host-toolbar-session-runtime.ts`. Session preloads
+ * are always loaded as CommonJS, so this points at the `.cjs` bundle (same
+ * rule `cjsSiblingPreloadPath` exists for). Resolved from the package root so
+ * npm/pnpm node_modules and ASAR packaging alike get an absolute, correct path.
+ */
+export const hostToolbarRuntimePreloadPath = path.join(
+  devtoolsPackageRoot,
+  'dist/preload/windows/host-toolbar-runtime.cjs',
+)
+
+/** Session-registered sidebar-runtime preload bundle, mirroring {@link hostToolbarRuntimePreloadPath}. */
+export const hostSidebarRuntimePreloadPath = path.join(
+  devtoolsPackageRoot,
+  'dist/preload/windows/host-sidebar-runtime.cjs',
+)
+
+/** Session-registered dialog-runtime preload bundle, mirroring {@link hostToolbarRuntimePreloadPath}. */
+export const hostDialogRuntimePreloadPath = path.join(
+  devtoolsPackageRoot,
+  'dist/preload/windows/host-dialog-runtime.cjs',
+)
+
+export const simulatorDir = path.join(devtoolsPackageRoot, 'dist/simulator')
+
+/**
+ * DevTools builds its own copy of every native mini-app runtime asset. Pin the
+ * shared runtime bridge to that copy so a packaged client never depends on the
+ * standalone npm package's optional asset assembly step.
+ */
+export const runtimeAssetPaths = {
+  root: path.join(devtoolsPackageRoot, 'dist'),
+  simulatorDir,
+  simulatorPreloadPath: path.join(
+    devtoolsPackageRoot,
+    'dist/preload/windows/simulator.cjs',
+  ),
+  renderHostHtmlPath: path.join(devtoolsPackageRoot, 'dist/render-host/pageFrame.html'),
+  renderHostPreloadPath: path.join(devtoolsPackageRoot, 'dist/render-host/preload.cjs'),
+  serviceHostHtmlPath: path.join(devtoolsPackageRoot, 'dist/service-host/service.html'),
+  serviceHostPreloadPath: path.join(devtoolsPackageRoot, 'dist/service-host/preload.cjs'),
+} satisfies NonNullable<RuntimeContext['assets']>
+
+export function getRendererDir(): string {
+  return rendererDir
+}
+
+export function getPreloadDir(): string {
+  return path.join(devtoolsPackageRoot, 'dist/preload')
+}
+
+export function getRendererHtml(filename: string): string {
+  return path.join(rendererDir, filename)
+}

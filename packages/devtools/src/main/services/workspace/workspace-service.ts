@@ -1,0 +1,494 @@
+import type { AppInfo, CompileConfig, ProjectSession } from '../../../shared/types.js'
+import type { CompileModeCommand } from '../../../shared/compile-mode-state.js'
+import { createCompileModeManager, openCompileModeStoreAfterCompile } from './workspace-compile-modes.js'
+import type { CompileModeChange, CompileModeSnapshot, CompileModeStore } from './compile-mode-store.js'
+import { rejectInvalidAppId, validateProjectDirSafe } from './open-project-guards.js'
+// eslint-disable-next-line no-restricted-syntax -- grandfathered(workbench-context): shrink-only
+import type { WorkbenchContext } from '../workbench-context.js'
+import * as repo from '../projects/project-repository.js'
+import { reportRebuildStatus } from './rebuild-status.js'
+import type {
+  Project,
+  ProjectPages,
+  ProjectSettings,
+} from '../projects/project-repository.js'
+import type { ProjectPatch, ProjectsProvider } from '../projects/types.js'
+import { applyRefererForSession, clearRefererForSession } from './workspace-referer.js'
+import { loadWorkbenchSettings } from '../settings/index.js'
+import { createOpLock } from './op-lock.js'
+import { createThumbnailOps } from './workspace-thumbnails.js'
+import { collectCompileDiagnostics, type CompileDiagnostic } from '../../../shared/compile-diagnostics.js'
+// Thumbnail FS helpers are now consumed via LocalProjectsProvider; the
+// workspace-service only sees the ProjectsProvider hook surface.
+
+/**
+ * Result returned to the renderer after `project:open` finishes.
+ * Mirrors the previous inline shape in ipc/session.ts so no
+ * renderer-side change is required.
+ */
+export interface OpenProjectResult {
+  success: boolean
+  port?: number
+  appInfo?: AppInfo
+  error?: string
+}
+
+/**
+ * The single source of truth for project + session + project-settings.
+ *
+ * Responsibilities:
+ *  - list / add / remove projects (delegates to the repository module for fs)
+ *  - open / close the active project session (drives the adapter, owns
+ *    session and project-path state in a private closure)
+ *  - read / write per-project compile + project.config.json settings
+ *
+ * IPC handlers, menu items and other callers must go through this service
+ * rather than touching the repository or adapter directly.
+ */
+export interface WorkspaceService {
+  // ── project list ────────────────────────────────────────────────────────
+  // Methods that flow through the host-injected ProjectsProvider are async,
+  // so a remote provider (e.g. a host application's cloud workspace) works the same as the
+  // local FS-backed default. Callers must await.
+  listProjects(): Promise<Project[]>
+  addProject(dirPath: string): Promise<Project>
+  removeProject(dirPath: string): Promise<void>
+  updateProject(dirPath: string, patch: ProjectPatch): Promise<Project>
+  hasProject(dirPath: string): Promise<boolean>
+  validateProjectDir(dirPath: string): Promise<string | null>
+
+  // ── session lifecycle ───────────────────────────────────────────────────
+  openProject(projectPath: string): Promise<OpenProjectResult>
+  closeProject(): Promise<void>
+
+  // ── session state (read-only) ──────────────────────────────────────────
+  getSession(): ProjectSession | null
+  getProjectPath(): string
+  /**
+   * The project path most recently torn down by `closeProject`, or '' if none
+   * since the last `openProject`. Lets the project-fs sandbox accept an
+   * in-flight write (debounced/teardown flush) that targets the just-closed
+   * project even though `getProjectPath()` has already been cleared. Reset to
+   * '' on the next `openProject` so it never accumulates stale roots.
+   */
+  getLastClosedProjectPath(): string
+  hasActiveSession(): boolean
+  /**
+   * True only while `closeProject` is tearing down. Bridge active-content
+   * resolution consults this to avoid resolving the dying session's guest during
+   * the close's session.close() await (when currentSession is already null but
+   * the bridge app session still exists).
+   */
+  isClosing(): boolean
+
+  // ── thumbnails ──────────────────────────────────────────────────────────
+  // Both methods flow through the host-injected ProjectsProvider too; a
+  // remote host can store/serve screenshots from its own backend. Default
+  // (LocalProjectsProvider) round-trips through `<userData>/thumbnails/`.
+  captureThumbnail(projectPath: string): Promise<string | null>
+  getThumbnail(projectPath: string): Promise<string | null>
+
+  // ── per-project data ────────────────────────────────────────────────────
+  getProjectPages(projectPath: string): ProjectPages
+  getCompileConfig(projectPath: string): Promise<CompileConfig>
+  saveCompileConfig(projectPath: string, config: CompileConfig): Promise<void>
+  getCompileModeState(projectPath?: string): CompileModeSnapshot
+  applyCompileModeCommand(command: CompileModeCommand): Promise<CompileModeChange>
+  getProjectSettings(projectPath: string): ProjectSettings
+  updateProjectSettings(
+    projectPath: string,
+    patch: Partial<ProjectSettings>,
+  ): void
+}
+
+/** Build a workspace service bound to the given workbench context. */
+export function createWorkspaceService(ctx: WorkbenchContext): WorkspaceService {
+  let currentSession: ProjectSession | null = null
+  let currentProjectPath = ''
+  // True only while closeProject tears down. disposeSession nulls currentSession
+  // before awaiting session.close(), but the bridge app session lives until the
+  // later disposeAll — bridge getters consult this to refuse resolving the dying
+  // project's guest during that window.
+  let closing = false
+  // The last project path cleared by `closeProject`; consumed by project-fs to
+  // accept an in-flight write that targets the just-closed project. Reset at
+  // the start of every `openProject` so it never accumulates a stale root.
+  let lastClosedProjectPath = ''
+  // Session generation for the onLog closure handed to the adapter: a closed
+  // (or switched-away-from) session's compile worker dies asynchronously, so
+  // buffered log lines can still arrive through the OLD closure after
+  // closeProject/openProject. Each openProject claims a new generation and
+  // closeProject invalidates the current one; a stale closure sees the
+  // mismatch and drops the line instead of polluting the next project's
+  // compile panel. (Deliberately NOT a `currentSession !== null` check: the
+  // first compile's log lines arrive while the adapter promise is still
+  // pending, before currentSession is assigned.)
+  let logGeneration = 0
+
+  // Serializes openProject/closeProject teardown/commit sections (FIFO) + latest-
+  // wins request tokens, so a close mid-open can't disposeAll() the views the open
+  // is building or desync currentSession vs the bridge appSessions. See op-lock.ts.
+  const opLock = createOpLock()
+
+  function sendStatus(status: string, message: string, hotReload?: boolean, pages?: string[], watcherDead?: boolean, diagnostics?: CompileDiagnostic[], previewStale = false): void {
+    const safeDiagnostics = diagnostics === undefined ? (status === 'error' && !watcherDead ? [] : undefined) : collectCompileDiagnostics({ diagnostics })
+    ctx.notify.projectStatus({ status, message, ...(safeDiagnostics === undefined ? {} : { diagnostics: safeDiagnostics }), ...(hotReload ? { hotReload: true } : {}), ...(pages ? { pages } : {}), ...(watcherDead ? { watcher: 'dead' as const } : {}), ...(previewStale ? { previewStale: true } : {}) })
+  }
+
+  function bestEffort(label: string, fn: () => void | Promise<void>): void {
+    try {
+      void Promise.resolve(fn()).catch((err) => {
+        console.warn(`[workspace] ${label} failed (non-fatal):`, err)
+      })
+    } catch (err) {
+      console.warn(`[workspace] ${label} failed (non-fatal):`, err)
+    }
+  }
+
+  async function disposeSession(): Promise<void> {
+    if (!currentSession) return
+    const session = currentSession
+    currentSession = null
+    try {
+      await Promise.race([
+        session.close(),
+        new Promise<never>((_, reject) =>
+          setTimeout(() => reject(new Error('session close timed out')), 5000),
+        ),
+      ])
+    } catch (err) {
+      console.error('[workspace] session close failed:', err)
+    }
+  }
+
+  /**
+   * openProject critical section 1 — tear down the outgoing runtime under the op
+   * lock (the unbounded compile runs after this releases, so a queued close isn't
+   * blocked). Returns true when superseded (caller aborts without touching the
+   * newer request's runtime).
+   */
+  async function runOpenTeardown(mySeq: number): Promise<boolean> {
+    const release = await opLock.acquire()
+    try {
+      if (!opLock.isOwner(mySeq)) return true
+      clearRefererForSession(currentSession, currentProjectPath)
+      // Switching projects tears down the embedded workbench editor (mirrors one
+      // project's disk; saves would else hit the wrong project) AND the native
+      // simulator (its 'destroyed' hook owns the bridge session). Back-to-list
+      // never calls closeProject, so this is the only deterministic teardown.
+      if (currentSession !== null) {
+        ctx.views.detachWorkbench()
+        ctx.views.detachSimulator()
+      }
+      // Invalidate the outgoing onLog generation before teardown so the dying
+      // worker's buffered lines can't pollute the incoming compile timeline.
+      logGeneration++
+      // Dies with the outgoing session — no-op when none is open.
+      compileModes.disposeCurrent()
+      await disposeSession()
+      currentProjectPath = ''
+      lastClosedProjectPath = ''
+      return false
+    } finally {
+      release()
+    }
+  }
+
+  /**
+   * openProject critical section 2 — commit the new session (and its
+   * compile-mode store handle) under the lock, only if still the latest
+   * request. Returns false when superseded (caller discards the
+   * freshly-opened session and store instead of clobbering the newer
+   * request's). `compileModes.adopt` must only run here, alongside
+   * `currentSession`/`currentProjectPath`, so the "current store" and
+   * "current session" always switch together.
+   */
+  async function runOpenCommit(
+    mySeq: number,
+    session: ProjectSession,
+    projectPath: string,
+    store: CompileModeStore,
+  ): Promise<boolean> {
+    const release = await opLock.acquire()
+    try {
+      if (!opLock.isOwner(mySeq)) return false
+      currentSession = session
+      currentProjectPath = projectPath
+      compileModes.adopt(store)
+      return true
+    } finally {
+      release()
+    }
+  }
+
+  /**
+   * Drive the compile adapter for one open (OUTSIDE the op lock): returns the
+   * session or an error message, never throws. The onLog generation guard drops
+   * a superseded session's buffered lines.
+   */
+  async function runCompile(
+    projectPath: string,
+    sessionGeneration: number,
+  ): Promise<{ session: ProjectSession; hasPublishedBuildResult: () => boolean } | { error: string; diagnostics: CompileDiagnostic[] }> {
+    const { compile, preview } = loadWorkbenchSettings()
+    let hasPublishedBuildResult = false
+    try {
+      const session = await ctx.adapter.openProject({
+        projectPath,
+        sourcemap: true,
+        fileTypes: ctx.fileTypes,
+        // Two independent gates: autoBuild = recompile on save; autoReload = reflect the rebuild in the simulator afterwards (off ⇒ page/form state survives). A style-only rebuild takes the in-place stylesheet hot-swap path (see reportRebuildStatus); any other change does a full reload.
+        watch: compile.autoBuild,
+        autoReload: preview.autoReload,
+        hostedSourcemaps: true,
+        onRebuild: info => {
+          if (sessionGeneration !== logGeneration) return
+          hasPublishedBuildResult = true
+          reportRebuildStatus(info, { projectPath, repo, autoReload: preview.autoReload, refreshSimulatorStyles: ctx.views.refreshSimulatorStyles, sendStatus })
+        },
+        onBuildError: (err: unknown) => {
+          if (sessionGeneration !== logGeneration) return
+          hasPublishedBuildResult = true
+          const diagnostics = collectCompileDiagnostics(err)
+          const message = err instanceof Error ? err.message : typeof err === 'object' && err && typeof (err as { message?: unknown }).message === 'string' ? (err as { message: string }).message : String(err)
+          sendStatus('error', message, false, undefined, false, diagnostics, currentSession !== null)
+        },
+        // Watcher died mid-session (EMFILE, permission loss, …): non-fatal, so 'ready' stays but `watcher: 'dead'` flags that saves no longer auto-rebuild.
+        onWatcherError: () => {
+          if (sessionGeneration !== logGeneration) return
+          sendStatus('ready', '文件监听已停止，保存不再触发自动编译', false, undefined, true)
+        },
+        onLog: (entry: { stream: 'stdout' | 'stderr'; text: string }) => {
+          if (sessionGeneration !== logGeneration) return
+          ctx.notify.compileLog({ stream: entry.stream, text: entry.text, at: Date.now() })
+        },
+      })
+      return { session, hasPublishedBuildResult: () => hasPublishedBuildResult }
+    } catch (err) {
+      // No appId resolved for this attempt; the outgoing project's own entry
+      // was already cleared by runOpenTeardown, so there is nothing to clear.
+      return {
+        error: err instanceof Error ? err.message : String(err),
+        diagnostics: collectCompileDiagnostics(err),
+      }
+    }
+  }
+
+  // Delegate to the host-injected (or default LocalProjectsProvider)
+  // ProjectsProvider on the context. When the host omits an optional method,
+  // we apply a safe documented default — never silently fall back to
+  // `repo.*`, because a remote provider's project paths are not on the local
+  // filesystem.
+  const provider: ProjectsProvider = ctx.projectsProvider
+  // Owner of whichever project's compile modes are currently open; disposed/
+  // replaced alongside the session (teardown, openProject failures, close).
+  const compileModes = createCompileModeManager(provider, (change) => ctx.notify.compileModesChanged(change))
+  const thumbnails = createThumbnailOps({
+    ctx,
+    provider,
+    getSession: () => currentSession,
+    getProjectPath: () => currentProjectPath,
+  })
+
+  type CompiledOpen = Extract<Awaited<ReturnType<typeof runCompile>>, { session: ProjectSession }>
+
+  function permissionFailure(err: unknown, mySeq: number): OpenProjectResult {
+    const error = err instanceof Error ? err.message : String(err)
+    if (opLock.isLatestRequest(mySeq)) {
+      const { diagnostics, previewStale } = ctx.sessionStatus.get()
+      sendStatus('error', error, false, undefined, false, diagnostics, previewStale === true)
+    }
+    return { success: false, error }
+  }
+
+  async function completeCompiledOpen(
+    mySeq: number,
+    projectPath: string,
+    compiled: CompiledOpen,
+  ): Promise<OpenProjectResult> {
+    const session = compiled.session
+    const opened = await openCompileModeStoreAfterCompile(compileModes, projectPath, session)
+    if ('error' in opened) {
+      if (opLock.isOwner(mySeq)) sendStatus('error', opened.error)
+      return { success: false, error: opened.error }
+    }
+    const store = opened.store
+    const appIdError = await rejectInvalidAppId(session)
+    if (appIdError) {
+      store.dispose()
+      if (opLock.isOwner(mySeq)) sendStatus('error', appIdError)
+      return { success: false, error: appIdError }
+    }
+    if (!(await runOpenCommit(mySeq, session, projectPath, store))) {
+      store.dispose()
+      try { await session.close() } catch (closeErr) {
+        console.warn('[workspace] closing superseded open session failed (non-fatal):', closeErr)
+      }
+      return { success: false, error: 'superseded by a newer project open/close' }
+    }
+    bestEffort('updateLastOpened', () => provider.updateLastOpened?.(projectPath))
+    if (!compiled.hasPublishedBuildResult()) {
+      bestEffort('sendStatus', () => sendStatus('ready', '编译完成', false, undefined, false, session.diagnostics ?? []))
+    }
+    bestEffort('applyReferer', () => applyRefererForSession(session, projectPath))
+    return { success: true, port: session.port, appInfo: session.appInfo }
+  }
+
+  return {
+    listProjects: async () => provider.listProjects(),
+    addProject: async (dirPath) => provider.addProject(dirPath),
+    removeProject: async (dirPath) => {
+      await provider.removeProject(dirPath)
+    },
+    updateProject: async (dirPath, patch) => {
+      const projects = await provider.listProjects()
+      const existing = projects.find((p) => p.path === dirPath)
+      if (!existing) throw new Error(`No such project: ${dirPath}`)
+      // A provider without `updateProject` cannot persist the edit. Returning
+      // the record unchanged would look like a successful save to the
+      // renderer (dialog closes, list reloads) while silently discarding the
+      // user's input, so this must fail loudly instead.
+      if (!provider.updateProject) {
+        throw new Error('当前宿主不支持编辑项目')
+      }
+      return provider.updateProject(dirPath, patch)
+    },
+    hasProject: async (dirPath) => {
+      const projects = await provider.listProjects()
+      return projects.some((p) => p.path === dirPath)
+    },
+    validateProjectDir: async (dirPath) =>
+      provider.validateProjectDir
+        ? provider.validateProjectDir(dirPath)
+        : null,
+
+    async openProject(projectPath) {
+      // Claim a request seq before the veto hook's await so latest-wins is by
+      // REQUEST order, not by which hook resolves first.
+      const mySeq = opLock.nextSeq()
+      // Host permission gate (WorkbenchAppConfig.onBeforeOpenProject): a throwing
+      // hook vetoes the open and leaves the active session intact. Runs before
+      // any side effect and outside the op lock/token.
+      if (ctx.onBeforeOpenProject) {
+        try {
+          await ctx.onBeforeOpenProject(projectPath)
+        } catch (err) {
+          return permissionFailure(err, mySeq)
+        }
+      }
+      // Passed the veto — take ownership (a vetoed open never supersedes an
+      // in-flight one; ownerSeq only grows, so a late-resolving earlier request
+      // can't clobber a later one that already took over).
+      opLock.takeOwnership(mySeq)
+      // Defer the workbench editor's heavy attach while this open's
+      // boot-critical window (old-session teardown + first compile) runs.
+      // The release is idempotent and bound to this hold, so every exit path
+      // below releases unconditionally; the gate's own cap timer backstops
+      // any future path that forgets to.
+      const releaseWorkbenchHold = ctx.views.holdWorkbenchAttach()
+      if (await runOpenTeardown(mySeq)) {
+        releaseWorkbenchHold()
+        return { success: false, error: 'superseded by a newer project open/close' }
+      }
+
+      // Reject obviously broken projects up front so we never spin up a
+      // compile/server that the simulator will then fetch asset-by-asset.
+      // Without this guard, deleted recent-list entries and typo'd CLI paths
+      // ride all the way through to the container runtime, whose
+      // `fetch(…).then(r=>r.text()).then(JSON.parse)` pipeline dies on the
+      // dev server's HTML SPA fallback with
+      // `SyntaxError: Unexpected token '<', "<!doctype "…`.
+      const dirError = await validateProjectDirSafe(provider, projectPath)
+      if (!opLock.isOwner(mySeq)) { releaseWorkbenchHold(); return { success: false, error: 'superseded by a newer project open/close' } }
+      if (dirError) {
+        releaseWorkbenchHold()
+        sendStatus('error', dirError)
+        return { success: false, error: dirError }
+      }
+
+      sendStatus('compiling', '正在编译...')
+      // This open owns the log channel until the next open/close bumps the
+      // generation — runCompile's onLog closure checks it per line.
+      const sessionGeneration = ++logGeneration
+      const compiled = await runCompile(projectPath, sessionGeneration)
+      // The compile settling — success OR failure — ends the boot-critical
+      // window (a failed compile is when the user needs the editor most).
+      releaseWorkbenchHold()
+      if (!opLock.isOwner(mySeq)) {
+        try { if ('session' in compiled) await compiled.session.close() } catch (err) { console.warn('[workspace] closing superseded compile failed:', err) }
+        return { success: false, error: 'superseded by a newer project open/close' }
+      }
+      if ('error' in compiled) {
+        sendStatus('error', compiled.error, false, undefined, false, compiled.diagnostics)
+        return { success: false, error: compiled.error }
+      }
+      return completeCompiledOpen(mySeq, projectPath, compiled)
+    },
+
+    async closeProject() {
+      // Claim a request seq and take ownership immediately (close has no veto),
+      // then serialize against a concurrent openProject: disposeProjectViews()
+      // must not run while an open is mid-teardown/commit (it would tear down
+      // the views the open is building).
+      const mySeq = opLock.nextSeq()
+      opLock.takeOwnership(mySeq)
+      const release = await opLock.acquire()
+      try {
+        // Superseded by a newer open/close that arrived while we waited for the
+        // lock: that request now owns the runtime, so disposing here would tear
+        // down ITS views. Skip — the newer op's own teardown covers the session
+        // we meant to close.
+        if (!opLock.isOwner(mySeq)) return
+        // Void any in-flight open's workbench attach hold BEFORE the teardown
+        // awaits below: the superseded open's compile can settle mid-close, and
+        // its release (or the gate's cap) must not rebuild the editor view for
+        // a project that is being closed.
+        ctx.views.cancelWorkbenchAttachHold()
+        // Mark the close in progress BEFORE disposeSession nulls currentSession,
+        // so bridge getters refuse to resolve the dying session during the
+        // session.close() await (cleared in the finally once views are gone).
+        closing = true
+        // Invalidate the active session's onLog BEFORE teardown starts — lines
+        // flushed by the dying compile worker must not reach the panel.
+        logGeneration++
+        bestEffort('sendStatus', () => sendStatus('idle', ''))
+        compileModes.disposeCurrent() // dies with the session
+        clearRefererForSession(currentSession, currentProjectPath)
+        await disposeSession()
+        // Record the root being torn down BEFORE clearing it, so a teardown/
+        // debounced write already in flight can still be accepted against it.
+        if (currentProjectPath !== '') lastClosedProjectPath = currentProjectPath
+        currentProjectPath = ''
+        // Project-scoped views only. The host toolbar is HOST-scoped and must
+        // survive closing a project — its full teardown (disposeAll) runs from
+        // the context registry at app teardown instead.
+        ctx.views.disposeProjectViews()
+      } finally {
+        closing = false
+        release()
+      }
+    },
+
+    getSession: () => currentSession,
+    getProjectPath: () => currentProjectPath,
+    getLastClosedProjectPath: () => lastClosedProjectPath,
+    hasActiveSession: () => currentSession !== null,
+    isClosing: () => closing,
+
+    captureThumbnail: thumbnails.captureThumbnail,
+    getThumbnail: thumbnails.getThumbnail,
+
+    // `getProjectPages` reads the project's own `app.json` from disk and is
+    // independent of the project registry — it stays on the repo helper.
+    getProjectPages: (projectPath) => repo.getProjectPages(projectPath),
+    getCompileConfig: (projectPath) => compileModes.getCompileConfig(projectPath),
+    saveCompileConfig: (projectPath, config) => compileModes.saveCompileConfig(projectPath, config),
+    getCompileModeState: (projectPath) => compileModes.getCompileModeState(projectPath),
+    applyCompileModeCommand: (command) => compileModes.applyCompileModeCommand(command),
+    // Per-project settings (uploadWithSourceMap etc.) live in the project's
+    // own `project.config.json`, not the registry — keep direct repo calls.
+    getProjectSettings: (projectPath) => repo.getProjectSettings(projectPath),
+    updateProjectSettings: (projectPath, patch) =>
+      repo.updateProjectSettings(projectPath, patch),
+  }
+}

@@ -1,0 +1,239 @@
+import {
+  useEffect,
+  useMemo,
+  useRef,
+  useState,
+} from 'react'
+import type { RefObject } from 'react'
+import {
+  attachNativeSimulator,
+  captureThumbnail,
+  onSimulatorCurrentPage,
+  softReloadNativeSimulator,
+} from '@/shared/api'
+import type { AppInfo } from '@/shared/api'
+import {
+  buildSimulatorUrl,
+  decodePageSpec,
+  getCurrentPageRoute,
+} from '../../../../../../shared/simulator-route'
+import type { CompileConfig } from '@/shared/types'
+import type { CompileStatus, DeviceType } from './runtime-types'
+
+export interface UseSimulatorProps {
+  compileStatus: CompileStatus
+  sendDeviceInfo: (device: DeviceType) => void
+  simPanelWidthRef: RefObject<number>
+  deviceRef: RefObject<DeviceType>
+  appInfo: AppInfo | null
+  compileConfig: CompileConfig
+  port: number
+  projectPath: string
+  /**
+   * Hot-reload signal from `useSession`: bumped once per watcher rebuild
+   * (`projectStatus` with `hotReload: true`). Each bump respawns the
+   * DeviceShell exactly once via `attachNativeSimulator`.
+   */
+  hotReloadToken: number
+  /**
+   * Explicit-relaunch signal from `useSession`: bumped once per 重新编译 / retry.
+   * Unlike `hotReloadToken` (a soft reload preserving the current page), this
+   * forces a hard re-attach at `startPage` even when `simulatorUrl` is
+   * unchanged, so an explicit relaunch always resets the drifted page.
+   */
+  relaunchNonce: number
+}
+
+export interface SimulatorHookResult {
+  simulatorUrl: string
+  /** Bare page path of the visible top-of-stack page (no query). Kept query-free
+   * so AppData's bridge auto-follow (`activePagePath`) keeps matching. */
+  currentPage: string
+  /** `pagePath?k=v&…` route of the visible page, query included. Shown in the
+   * simulator's page-path bar (WeChat DevTools parity) and used to restore the
+   * current page's params on a watcher hot reload. */
+  currentRoute: string
+}
+
+export function useSimulator(props: UseSimulatorProps): SimulatorHookResult {
+  const {
+    compileStatus,
+    sendDeviceInfo,
+    simPanelWidthRef,
+    deviceRef,
+    appInfo,
+    compileConfig,
+    port,
+    projectPath,
+    hotReloadToken,
+    relaunchNonce,
+  } = props
+
+  const simulatorUrl = useMemo(() => {
+    if (!appInfo || !port) return ''
+    return buildSimulatorUrl(appInfo.appId, compileConfig, port)
+  }, [appInfo, compileConfig, port])
+
+  const [currentRoute, setCurrentRoute] = useState(() =>
+    getCurrentPageRoute(simulatorUrl),
+  )
+
+  const currentPage = useMemo(
+    () => decodePageSpec(currentRoute).pagePath,
+    [currentRoute],
+  )
+
+  useEffect(() => {
+    setCurrentRoute(getCurrentPageRoute(simulatorUrl))
+  }, [simulatorUrl])
+
+  // The page stack lives in the DeviceShell WebContentsView, so in-app
+  // navigation never reaches a renderer `<webview>`'s did-navigate events.
+  // Subscribe to main's active-page push so the toolbar route stays in sync.
+  // Empty route = unknown → keep the URL-seeded value.
+  useEffect(() => {
+    return onSimulatorCurrentPage((route) => {
+      if (route) setCurrentRoute(route)
+    })
+  }, [])
+
+  // Latest-value mirror for the hot-reload path. The attach effect must NOT
+  // depend on `currentPage`/`compileConfig`/`appInfo`/`port` directly (in-app
+  // navigation or config identity churn would re-attach the simulator), so it
+  // reads them through this render-synced ref instead. The sync effect has no
+  // dep array (runs every render) and is declared BEFORE the attach effect so
+  // the context is always fresh when the attach effect reads it.
+  const hotReloadContextRef = useRef({ currentPage, currentRoute, compileConfig, appInfo, port })
+  useEffect(() => {
+    hotReloadContextRef.current = { currentPage, currentRoute, compileConfig, appInfo, port }
+  })
+
+  // Last token/nonce the attach effect has consumed. Seeded with the initial
+  // values so the mount attach is a plain attach, not a hot reload.
+  const attachedHotReloadTokenRef = useRef(hotReloadToken)
+  const attachedRelaunchNonceRef = useRef(relaunchNonce)
+
+  // ── Mount the simulator as a main-process WebContentsView ───────────────────
+  // We ask main to create + load the WCV with the simulatorUrl; main's preload
+  // then drives SPAWN → DeviceShell. `currentPage` mirrors the URL (page-stack
+  // nav happens inside the WCV and arrives via onSimulatorCurrentPage above).
+  //
+  // `hotReloadToken` resurrects the hot-reload guard a later refactor deleted:
+  // a watcher rebuild bumps the token, the effect re-runs exactly once, and
+  // `attachNativeSimulator` tears down + respawns the DeviceShell (the
+  // native-host reload primitive, view-manager.ts attachNativeSimulator).
+  useEffect(() => {
+    if (compileStatus.status !== 'ready') return
+    if (!simulatorUrl) return
+
+    // An explicit relaunch (relaunchNonce bumped) is NOT a hot reload: it
+    // hard-attaches at `startPage` (the else branch below), resetting the
+    // drifted page — even when `simulatorUrl` is byte-identical, because
+    // `relaunchNonce` is in this effect's deps. The explicit signal WINS when
+    // both changed since the last run: a hot-reload token that lands together
+    // with a relaunch nonce (e.g. a broadcast racing the relaunch IPC reply)
+    // must not downgrade the user's requested reset into a soft reload of the
+    // drifted page.
+    const explicitRelaunch = relaunchNonce !== attachedRelaunchNonceRef.current
+    const isHotReload = !explicitRelaunch && hotReloadToken !== attachedHotReloadTokenRef.current
+    attachedHotReloadTokenRef.current = hotReloadToken
+    attachedRelaunchNonceRef.current = relaunchNonce
+
+    let attachUrl = simulatorUrl
+    if (isHotReload) {
+      // Reload at the page the user is looking at (the onSimulatorCurrentPage
+      // mirror), not the configured startPage — the native equivalent of the
+      // old `collapseRouteToTopPage` semantics, with the page's own query
+      // restored. The startPage's configured queryParams only apply while the
+      // user is on the startPage; anywhere else the CURRENT page's params are
+      // what must survive the recompile (WeChat DevTools keeps the page stack's
+      // route+query across incremental compiles). scene is re-added by
+      // `buildSimulatorUrl` from `compileConfig.scene`.
+      const ctx = hotReloadContextRef.current
+      if (ctx.appInfo && ctx.port) {
+        const spec = decodePageSpec(ctx.currentRoute)
+        const reloadPage = spec.pagePath || ctx.compileConfig.startPage
+        attachUrl = buildSimulatorUrl(
+          ctx.appInfo.appId,
+          {
+            ...ctx.compileConfig,
+            startPage: reloadPage,
+            queryParams: Object.entries(spec.query).map(([key, value]) => ({ key, value })),
+          },
+          ctx.port,
+        )
+      }
+    }
+
+    // Push the device BEFORE attaching: main caches it so the simulator WCV's
+    // preload picks it up synchronously (NATIVE_HOST_ENABLED reply), letting the
+    // DeviceShell mount at the right bezel size / notch without a flash.
+    sendDeviceInfo(deviceRef.current!)
+    let cancelled = false
+    let captureTimer: number | null = null
+
+    const scheduleThumbnail = (): void => {
+      if (cancelled) return
+      // Short paint grace period from the readiness point (hard path: attach
+      // resolves at the first render guest's did-finish-load; soft path: the
+      // in-place swap completes well within it).
+      captureTimer = window.setTimeout(() => {
+        if (!cancelled) {
+          void captureThumbnail(projectPath).catch(() => {})
+        }
+      }, 3_000)
+    }
+
+    const hardAttach = (): void => {
+      void attachNativeSimulator(attachUrl, simPanelWidthRef.current!)
+        .then(scheduleThumbnail)
+        .catch(() => {
+          // Attach failures are surfaced by the simulator path. Thumbnail
+          // capture is best-effort and must not add an unhandled rejection.
+        })
+    }
+
+    if (isHotReload) {
+      // Soft-first: ask main to RELAUNCH the live DeviceShell in place (the
+      // phone shell never unmounts; the new session swaps in when ready). Only
+      // `true` means accepted — anything else (no live+ready shell, lenient
+      // invoke swallowing a failure) falls back to the hard rebuild.
+      void softReloadNativeSimulator(attachUrl)
+        .then((accepted) => {
+          if (cancelled) return
+          if (accepted === true) {
+            scheduleThumbnail()
+            return
+          }
+          hardAttach()
+        })
+        .catch(() => {
+          if (!cancelled) hardAttach()
+        })
+    } else {
+      hardAttach()
+    }
+
+    return () => {
+      cancelled = true
+      if (captureTimer !== null) {
+        window.clearTimeout(captureTimer)
+      }
+    }
+  }, [
+    compileStatus.status,
+    simulatorUrl,
+    hotReloadToken,
+    relaunchNonce,
+    simPanelWidthRef,
+    deviceRef,
+    sendDeviceInfo,
+    projectPath,
+  ])
+
+  return {
+    simulatorUrl,
+    currentPage,
+    currentRoute,
+  }
+}

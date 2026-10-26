@@ -1,0 +1,85 @@
+{
+    "name": "@dimina-studio/devkit",
+    "version": "0.2.0",
+    "description": "Development toolkit for Dimina mini-apps with H5 container preview",
+    "keywords": [
+        "dimina",
+        "mini-app",
+        "miniprogram",
+        "h5",
+        "preview",
+        "compiler",
+        "dev-server",
+        "container"
+    ],
+    "type": "module",
+    "engines": {
+        "node": ">=20"
+    },
+    "license": "MIT",
+    "author": "lbb00",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/lbb00/dimina-studio.git",
+        "directory": "packages/devkit"
+    },
+    "bugs": {
+        "url": "https://github.com/lbb00/dimina-studio/issues"
+    },
+    "homepage": "https://github.com/lbb00/dimina-studio/tree/main/packages/devkit#readme",
+    "main": "./dist/index.js",
+    "types": "./dist/index.d.ts",
+    "exports": {
+        ".": {
+            "types": "./dist/index.d.ts",
+            "default": "./dist/index.js"
+        },
+        "./watch-ignore": {
+            "types": "./dist/watch-ignore.d.ts",
+            "default": "./dist/watch-ignore.js"
+        }
+    },
+    "files": [
+        "dist",
+        "fe/index.js",
+        "fe/server.js",
+        "fe/server-container.js",
+        "fe/live-reload.js",
+        "fe/dimina-fe-container",
+        "fe/dimina-fe-server/index.js",
+        "fe/dimina-fe-server/THIRD_PARTY_NOTICES.md",
+        "README.md",
+        "LICENSE",
+        "!**/*.test.*",
+        "!**/*.spec.*"
+    ],
+    "scripts": {
+        "build": "tsc",
+        "check-types": "tsc --noEmit",
+        "lint": "eslint . --max-warnings 0",
+        "test": "vitest run --reporter=default --reporter=json --outputFile.json=test-report.json --coverage.enabled --coverage.reporter=json-summary --coverage.reportsDirectory=coverage",
+        "test:dev": "vitest",
+        "test:coverage": "vitest run --coverage",
+        "prepack": "pnpm run build"
+    },
+    "devDependencies": {
+        "@dimina-studio/eslint-config": "workspace:*",
+        "@dimina-studio/typescript-config": "workspace:*",
+        "@types/node": "^22.15.3",
+        "@vitest/coverage-v8": "^4.1.4",
+        "eslint": "^10.2.1",
+        "typescript": "5.9.2",
+        "vitest": "^4.1.4"
+    },
+    "dependencies": {
+        "@dimina-studio/compiler": "workspace:*",
+        "axios": "^1.15.0",
+        "chokidar": "^5.0.0",
+        "cors": "^2.8.6",
+        "express": "^5.2.1",
+        "open": "^11.0.0"
+    },
+    "publishConfig": {
+        "access": "public"
+    }
+}

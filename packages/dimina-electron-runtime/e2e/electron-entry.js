@@ -1,0 +1,335 @@
+// E2E test entry for @dimina-studio/electron-runtime's own Playwright suite.
+//
+// Wires the package's PUBLIC embedding facade exactly as documented in
+// README.md, then exposes a small set of test-only introspection/automation
+// hooks on `globalThis.__diminaE2eHooks`. Playwright drives this SAME main
+// process directly via `electronApp.evaluate()` — there is no automation
+// server / WebSocket RPC layer here (unlike devtools' `--auto` mode), because
+// nothing outside this process needs to reach in.
+import { app, BrowserWindow } from 'electron'
+import path from 'node:path'
+import { fileURLToPath } from 'node:url'
+import {
+  createElectronRuntime,
+  registerElectronRuntimeSchemes,
+} from '@dimina-studio/electron-runtime'
+import { openProject as devkitOpenProject } from '@dimina-studio/devkit'
+import { AppDataAccumulator, decodeWorkerMessage, decodedToInput } from '@dimina-studio/inspect'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+const WINDOW_WIDTH = 390
+const WINDOW_HEIGHT = 844
+const NAV_METHODS = new Set(['navigateTo', 'redirectTo', 'reLaunch', 'switchTab'])
+
+// Same off-screen + focus-steal neutering as packages/devtools/e2e/electron-entry.js
+// (test-only; keeps the developer running the suite locally from losing focus).
+if (process.platform === 'darwin') {
+  app.whenReady().then(() => {
+    try { app.dock?.hide() } catch { /* not on darwin, or already hidden */ }
+  })
+}
+const moveOffscreen = (win) => {
+  try {
+    win.setPosition(-2000, -2000)
+    if (typeof win.blur === 'function') win.blur()
+  } catch { /* window may already be closing */ }
+}
+app.on('browser-window-created', (_e, win) => {
+  try {
+    win.once('ready-to-show', () => moveOffscreen(win))
+    win.on('show', () => moveOffscreen(win))
+    win.on('focus', () => { try { win.blur() } catch { /* closing */ } })
+    win.focus = () => { try { win.blur() } catch { /* closing */ } }
+  } catch { /* closing */ }
+})
+
+// Everything below runs inside an async IIFE rather than as top-level
+// `await` — on this Electron/Node combination, top-level `await` in the ESM
+// entry module's own top-level scope hangs `app.whenReady()` forever (no
+// error, no crash, no child process — verified in isolation with a minimal
+// repro). The exact same `await` sequence inside a non-top-level async
+// function resolves normally, so everything past the static imports and
+// event-listener registration above is deferred into one.
+void (async () => {
+
+registerElectronRuntimeSchemes()
+await app.whenReady()
+
+const hostWindow = new BrowserWindow({
+  width: WINDOW_WIDTH,
+  height: WINDOW_HEIGHT,
+  webPreferences: {
+    preload: path.join(__dirname, 'test-preload.cjs'),
+    contextIsolation: true,
+  },
+})
+// The host window never shows real UI — it only needs to exist as a renderer
+// process for test-preload.cjs's contextBridge API (window.__diminaTestIpc)
+// to attach to, for the small number of specs that drive raw `dmb:*` IPC.
+await hostWindow.loadURL('data:text/html,<title>dimina-electron-runtime e2e host</title>')
+
+const runtime = await createElectronRuntime({
+  hostWindow,
+  adapter: { openProject: devkitOpenProject },
+})
+
+let currentSession = null
+
+// -- Page-data tap: mirrors packages/devtools/src/main/services/simulator-appdata
+// (setupSimulatorAppData), reimplemented against the PUBLIC `runtime.on(...)`
+// event surface instead of devtools' internal AppDataTap wiring. -----------
+const appDataAccumulators = new Map()
+
+function accumulatorFor(appId) {
+  let acc = appDataAccumulators.get(appId)
+  if (!acc) {
+    acc = new AppDataAccumulator()
+    appDataAccumulators.set(appId, acc)
+  }
+  return acc
+}
+
+runtime.on('app-data-message', ({ appId, message }) => {
+  const entries = decodeWorkerMessage(message)
+  if (!entries) return
+  const acc = accumulatorFor(appId)
+  for (const entry of entries) acc.apply(decodedToInput(entry))
+})
+
+runtime.on('app-data-evict', ({ appId, bridgeId }) => {
+  appDataAccumulators.get(appId)?.clearBridge(bridgeId)
+})
+
+function resolveAppDataPath(data, pathKey) {
+  if (!pathKey) return data
+  const keys = pathKey.replace(/\[(\d+)\]/g, '.$1').split('.')
+  let val = data
+  for (const k of keys) {
+    if (val == null || typeof val !== 'object') return undefined
+    val = val[k]
+  }
+  return val
+}
+
+// -- Bridge-backed introspection: ports packages/devtools/src/main/services/
+// automation/{handlers/app.ts,exec.ts,wait-active-page.ts} against the
+// process-global `__diminaBridgeHandle` bridge-router.ts exposes under
+// NODE_ENV=test, since createElectronRuntime()'s public facade doesn't return
+// the bridge handle itself. -------------------------------------------------
+function getBridge() {
+  const bridge = globalThis.__diminaBridgeHandle
+  if (!bridge) throw new Error('[e2e] bridge-router handle not installed yet')
+  return bridge
+}
+
+/** Decode `pagePath?k=v` into `{ pagePath, query }` (mirrors devtools' simulator-route.ts). */
+function decodePageSpec(value) {
+  const qIdx = value.indexOf('?')
+  if (qIdx < 0) return { pagePath: value, query: {} }
+  const pagePath = value.slice(0, qIdx)
+  const query = {}
+  for (const pair of value.slice(qIdx + 1).split('&')) {
+    if (!pair) continue
+    const eqIdx = pair.indexOf('=')
+    const k = eqIdx >= 0 ? pair.slice(0, eqIdx) : pair
+    const v = eqIdx >= 0 ? pair.slice(eqIdx + 1) : ''
+    if (k) query[decodeURIComponent(k)] = decodeURIComponent(v)
+  }
+  return { pagePath, query }
+}
+
+async function getCurrentPage(appId) {
+  const bridge = getBridge()
+  const renderWc = bridge.getActiveRenderWc(appId)
+  if (!renderWc) return { pageId: 1, path: '', query: {} }
+  const search = await renderWc.executeJavaScript('location.search').catch(() => '')
+  const params = new URLSearchParams(search.startsWith('?') ? search.slice(1) : search)
+  const pagePath = params.get('pagePath') || ''
+  if (!pagePath) return { pageId: 1, path: '', query: {} }
+  const spec = decodePageSpec(pagePath)
+  return { pageId: 1, path: spec.pagePath, query: spec.query }
+}
+
+function getPageStack(appId) {
+  const bridge = getBridge()
+  const stack = bridge.getPageStack?.(appId)
+  if (!stack || stack.length === 0) return []
+  return stack.map((entry, i) => ({
+    pageId: i + 1,
+    path: entry.pagePath,
+    query: Object.fromEntries(Object.entries(entry.query ?? {}).map(([k, v]) => [k, String(v)])),
+  }))
+}
+
+function getPageData(appId, path) {
+  const bridge = getBridge()
+  const bridgeId = bridge.getActiveBridgeId(appId)
+  const data = bridgeId ? (appDataAccumulators.get(appId)?.pageData(bridgeId) ?? {}) : {}
+  return resolveAppDataPath(data, path)
+}
+
+/** Ports wait-active-page.ts's timeout-floor "wait for the bridge's next activePage signal". */
+function waitForActivePage(bridge, { since, timeoutMs }) {
+  return new Promise((resolve) => {
+    let settled = false
+    let unsubscribe = null
+    const finish = () => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      unsubscribe?.()
+      resolve()
+    }
+    unsubscribe = bridge.onRenderEvent((event) => {
+      if (settled || event.kind !== 'activePage') return
+      if (event.bridgeId !== since) finish()
+    })
+    const timer = setTimeout(finish, timeoutMs)
+    const current = bridge.getActiveBridgeId()
+    if (current !== null && current !== since) finish()
+  })
+}
+
+/**
+ * Under sustained load the `executeJavaScript` dispatch below can occasionally
+ * reject with a generic, detail-free error (observed: "Script failed to
+ * execute") that doesn't say whether `wx.<method>(...)` actually ran in the
+ * renderer before the round-trip back here broke.
+ *
+ * This deliberately does NOT retry. Two prior attempts at a safe retry were
+ * tried and rejected on review: (1) a Playwright-side compensation check
+ * matching the target path via a later `getCurrentPage` call — unsound, both
+ * a false-positive substring match against unrelated routes and a race
+ * against the very signal it was reading; (2) comparing `bridge.
+ * getActiveBridgeId()` against a pre-dispatch snapshot here — still unsound,
+ * since `ACTIVE_PAGE` carries no correlation to a specific invocation (an
+ * unrelated concurrent navigation, or a same-tab `switchTab` that legitimately
+ * keeps the same bridge id, both defeat it either direction). A genuinely safe
+ * retry needs a per-invocation correlation/idempotency token threaded through
+ * the actual nav protocol (NAV_ACTION/NAV_CALLBACK or equivalent) — a
+ * production bridge-protocol change, not something worth doing just to
+ * suppress a rare test-only flake. Don't reintroduce an in-band signal
+ * comparison as a substitute; it can't establish causality.
+ */
+async function runNativeHostNav(bridge, serviceWc, method, args) {
+  const arg = method === 'navigateBack' ? (args[0] ?? { delta: 1 }) : (args[0] ?? {})
+  const since = bridge.getActiveBridgeId()
+  // Wrapped the same way runNativeHostGeneric wraps its call. A bare
+  // executeJavaScript still awaits whatever `wx.<method>()` returns, so a
+  // rejected nav promise fails this call — but Electron reports it as the
+  // generic "Script failed to execute", naming neither the method nor the
+  // reason. Keep awaiting the same outcome; only make the message readable.
+  await serviceWc.executeJavaScript(`
+    new Promise((resolve, reject) => {
+      const describe = (e) => {
+        if (e && e.errMsg) return String(e.errMsg)
+        if (e && e.message) return String(e.message)
+        try { return JSON.stringify(e) } catch { return String(e) }
+      }
+      try {
+        if (typeof wx === 'undefined' || typeof wx[${JSON.stringify(method)}] !== 'function') {
+          reject(new Error('wx.' + ${JSON.stringify(method)} + ' is not a function in service host'))
+          return
+        }
+        Promise.resolve(wx.${method}(${JSON.stringify(arg)})).then(
+          () => resolve(undefined),
+          (e) => reject(new Error('wx.' + ${JSON.stringify(method)} + ' rejected: ' + describe(e))),
+        )
+      } catch (e) { reject(new Error('wx.' + ${JSON.stringify(method)} + ' threw: ' + describe(e))) }
+    })
+  `)
+  const timeoutMs = method === 'navigateBack' ? 1500 : 2000
+  await waitForActivePage(bridge, { since, timeoutMs })
+  return { result: undefined }
+}
+
+async function runNativeHostGeneric(serviceWc, method, args) {
+  const argsStr = args.map((a) => JSON.stringify(a)).join(', ')
+  const result = await serviceWc.executeJavaScript(`
+    new Promise((resolve, reject) => {
+      try {
+        if (typeof wx === 'undefined' || typeof wx[${JSON.stringify(method)}] !== 'function') {
+          reject(new Error('wx.' + ${JSON.stringify(method)} + ' is not a function in service host'))
+          return
+        }
+        resolve(wx.${method}(${argsStr}))
+      } catch (e) { reject(e && e.message ? e.message : String(e)) }
+    })
+  `)
+  return { result }
+}
+
+/**
+ * How many pages the SERVICE realm's router currently holds, or -1 when the
+ * service host isn't reachable yet.
+ *
+ * Render-side readiness (`getCurrentPage`, which reads the visible render
+ * webContents' URL) does NOT imply this: the service router's stack is
+ * populated over the bridge and can still be empty when a page is already
+ * painted. `wx.switchTab` and friends dereference `router.getPageInfo().route`
+ * synchronously, and the router's empty-stack fallback (`{ id }`, see
+ * dimina/fe/packages/service/src/core/router.js) carries no `route` — so
+ * driving navigation before this count is positive throws inside the service
+ * realm rather than failing the navigation cleanly.
+ */
+async function getServicePageCount(appId) {
+  const bridge = getBridge()
+  const serviceWc = bridge.getServiceWc(appId)
+  if (!serviceWc) return -1
+  return serviceWc
+    .executeJavaScript(`(() => typeof getCurrentPages === 'function' ? getCurrentPages().length : -1)()`)
+    .catch(() => -1)
+}
+
+async function callWxMethod(method, args = [], appId) {
+  const bridge = getBridge()
+  const serviceWc = bridge.getServiceWc(appId)
+  if (!serviceWc) throw new Error('[e2e] service host not connected')
+  if (NAV_METHODS.has(method) || method === 'navigateBack') {
+    return runNativeHostNav(bridge, serviceWc, method, args)
+  }
+  return runNativeHostGeneric(serviceWc, method, args)
+}
+
+// -- Project lifecycle ------------------------------------------------------
+async function openProjectHook(projectPath, opts = {}) {
+  const session = await runtime.openProject({ projectPath, ...opts })
+  hostWindow.contentView.addChildView(session.view)
+  session.setBounds({ x: 0, y: 0, width: WINDOW_WIDTH, height: WINDOW_HEIGHT })
+  currentSession = session
+  await session.ready
+  return { appId: session.appInfo.appId, port: session.port }
+}
+
+async function closeProjectHook() {
+  const session = currentSession
+  if (!session) return
+  await session.dispose()
+  // Only clear the tracked session if nothing replaced it while we were
+  // awaiting dispose() — an overlapping openProject() call in between would
+  // have already made `session` stale (closeActiveSession no-ops on a stale
+  // owner) and installed its own session as `currentSession`; clearing
+  // unconditionally here would forget about that still-live session.
+  if (currentSession === session) currentSession = null
+}
+
+// Device switch goes entirely through the runtime's public API; the live
+// `wx.getSystemInfoSync()` snapshot update is consumed by the service-host
+// preload's `hostEnvUpdate` handling, not pushed here separately.
+function setDeviceHook(device) {
+  runtime.setDevice(device)
+}
+
+globalThis.__diminaE2eHooks = {
+  openProject: openProjectHook,
+  closeProject: closeProjectHook,
+  getCurrentPage,
+  getPageStack,
+  getPageData,
+  getServicePageCount,
+  callWxMethod,
+  setDevice: setDeviceHook,
+}
+
+})()

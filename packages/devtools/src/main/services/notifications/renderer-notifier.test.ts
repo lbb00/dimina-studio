@@ -1,0 +1,239 @@
+/**
+ * Verifies that `RendererNotifier` no-ops every send method once the target
+ * WebContents (or its hosting BrowserWindow / sub view) is destroyed, and
+ * never throws.
+ *
+ * Covers three target classes:
+ *   - main window methods (windowNavigateBack, compileModesChanged, projectStatus)
+ *     → routed via `ctx.windows.mainWindow.webContents.send`
+ *   - settings overlay (settingsInit) → routed via
+ *     `ctx.views.getSettingsWebContents().send`
+ *   - popoverInit takes a separate view argument; flipping its
+ *     `webContents.isDestroyed()` must also short-circuit the send
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest'
+import {
+  WindowChannel,
+  ProjectChannel,
+  EditorChannel,
+} from '../../../shared/ipc-channels.js'
+import { PopoverChannel, SettingsChannel } from '../../../shared/ipc-channels-overlays.js'
+import { createRendererNotifier } from './renderer-notifier.js'
+
+const COMPILE_MODES_CHANGED = (ProjectChannel as unknown as Record<string, string>).CompileModesChanged
+const COMPILE_MODES_APPLY_FAILED = (ProjectChannel as unknown as Record<string, string>).CompileModesApplyFailed
+
+function makeWebContents() {
+  return {
+    destroyed: false,
+    send: vi.fn(),
+    isDestroyed() { return this.destroyed },
+  }
+}
+
+function makeBrowserWindow() {
+  const wc = makeWebContents()
+  return {
+    destroyed: false,
+    webContents: wc,
+    isDestroyed() { return this.destroyed },
+  }
+}
+
+beforeEach(() => {
+  vi.clearAllMocks()
+})
+
+describe('RendererNotifier — destroyed targets no-op', () => {
+  it('windowNavigateBack: sends while alive, no-ops after mainWindow is destroyed', () => {
+    const mainWindow = makeBrowserWindow()
+    const settingsWc = makeWebContents()
+    const ctx = {
+      windows: { mainWindow: mainWindow as unknown as Electron.BrowserWindow },
+      views: { getSettingsWebContents: () => settingsWc as unknown as Electron.WebContents },
+    }
+    const notifier = createRendererNotifier(ctx)
+
+    notifier.windowNavigateBack()
+    expect(mainWindow.webContents.send).toHaveBeenCalledTimes(1)
+    expect(mainWindow.webContents.send).toHaveBeenCalledWith(WindowChannel.NavigateBack)
+
+    // Tear the window down: notifier must short-circuit at the BrowserWindow.isDestroyed gate.
+    mainWindow.destroyed = true
+    expect(() => notifier.windowNavigateBack()).not.toThrow()
+    expect(mainWindow.webContents.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('windowNavigateBack: no-ops once only the webContents is destroyed (window still alive)', () => {
+    const mainWindow = makeBrowserWindow()
+    const ctx = {
+      windows: { mainWindow: mainWindow as unknown as Electron.BrowserWindow },
+      views: { getSettingsWebContents: () => null },
+    }
+    const notifier = createRendererNotifier(ctx)
+
+    notifier.windowNavigateBack()
+    expect(mainWindow.webContents.send).toHaveBeenCalledTimes(1)
+
+    mainWindow.webContents.destroyed = true
+    expect(() => notifier.windowNavigateBack()).not.toThrow()
+    expect(mainWindow.webContents.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('windowOpenProject: sends the project payload on window:openProject and respects destroy', () => {
+    const mainWindow = makeBrowserWindow()
+    const ctx = {
+      windows: { mainWindow: mainWindow as unknown as Electron.BrowserWindow },
+      views: { getSettingsWebContents: () => null },
+    }
+    const notifier = createRendererNotifier(ctx)
+
+    notifier.windowOpenProject({ name: 'demo', path: '/proj/demo' })
+    expect(mainWindow.webContents.send).toHaveBeenCalledWith(
+      WindowChannel.OpenProject,
+      { name: 'demo', path: '/proj/demo' },
+    )
+
+    mainWindow.destroyed = true
+    expect(() => notifier.windowOpenProject({ name: 'demo', path: '/proj/demo' })).not.toThrow()
+    expect(mainWindow.webContents.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('compileModesChanged: sends the change while alive, no-ops after destruction', () => {
+    const mainWindow = makeBrowserWindow()
+    const ctx = {
+      windows: { mainWindow: mainWindow as unknown as Electron.BrowserWindow },
+      views: { getSettingsWebContents: () => null },
+    }
+    const notifier = createRendererNotifier(ctx)
+    const change = {
+      revision: 3,
+      state: { selectedId: null, entries: [] },
+      relaunch: true,
+    }
+
+    notifier.compileModesChanged(change)
+    expect(mainWindow.webContents.send).toHaveBeenCalledWith(COMPILE_MODES_CHANGED, change)
+
+    mainWindow.destroyed = true
+    notifier.compileModesChanged(change)
+    expect(mainWindow.webContents.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('compileModesApplyFailed: sends the error message while alive, no-ops after destruction', () => {
+    const mainWindow = makeBrowserWindow()
+    const ctx = {
+      windows: { mainWindow: mainWindow as unknown as Electron.BrowserWindow },
+      views: { getSettingsWebContents: () => null },
+    }
+    const notifier = createRendererNotifier(ctx)
+    const payload = { message: '磁盘写入失败' }
+
+    notifier.compileModesApplyFailed(payload)
+    expect(mainWindow.webContents.send).toHaveBeenCalledWith(COMPILE_MODES_APPLY_FAILED, payload)
+
+    mainWindow.destroyed = true
+    notifier.compileModesApplyFailed(payload)
+    expect(mainWindow.webContents.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('projectStatus: routes through mainWindow and respects destroy', () => {
+    const mainWindow = makeBrowserWindow()
+    const ctx = {
+      windows: { mainWindow: mainWindow as unknown as Electron.BrowserWindow },
+      views: { getSettingsWebContents: () => null },
+    }
+    const notifier = createRendererNotifier(ctx)
+
+    notifier.projectStatus({ status: 'compiling', message: '' })
+    expect(mainWindow.webContents.send).toHaveBeenNthCalledWith(
+      1,
+      ProjectChannel.Status,
+      { status: 'compiling', message: '' },
+    )
+
+    mainWindow.destroyed = true
+    notifier.projectStatus({ status: 'idle', message: '' })
+    expect(mainWindow.webContents.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('settingsInit: targets the settings overlay webContents and no-ops once it is destroyed', () => {
+    const mainWindow = makeBrowserWindow()
+    const settingsWc = makeWebContents()
+    const ctx = {
+      windows: { mainWindow: mainWindow as unknown as Electron.BrowserWindow },
+      views: {
+        getSettingsWebContents: () =>
+          (settingsWc.destroyed ? null : settingsWc) as unknown as Electron.WebContents | null,
+      },
+    }
+    const notifier = createRendererNotifier(ctx)
+    const payload = {
+      projectPath: '/x',
+      projectSettings: {} as import('../projects/project-repository.js').ProjectSettings,
+    }
+
+    notifier.settingsInit(payload)
+    expect(settingsWc.send).toHaveBeenCalledWith(SettingsChannel.Init, payload)
+    expect(mainWindow.webContents.send).not.toHaveBeenCalled()
+
+    settingsWc.destroyed = true
+    notifier.settingsInit(payload)
+    expect(settingsWc.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('settingsInit: also no-ops when getSettingsWebContents returns null (overlay hidden)', () => {
+    const mainWindow = makeBrowserWindow()
+    const ctx = {
+      windows: { mainWindow: mainWindow as unknown as Electron.BrowserWindow },
+      views: { getSettingsWebContents: () => null },
+    }
+    const notifier = createRendererNotifier(ctx)
+    expect(() =>
+      notifier.settingsInit({
+        projectPath: '',
+        projectSettings: {} as import('../projects/project-repository.js').ProjectSettings,
+      }),
+    ).not.toThrow()
+  })
+
+  it('popoverInit: routes via the passed-in popover view; destroyed sub view → no-op', () => {
+    const mainWindow = makeBrowserWindow()
+    const ctx = {
+      windows: { mainWindow: mainWindow as unknown as Electron.BrowserWindow },
+      views: { getSettingsWebContents: () => null },
+    }
+    const notifier = createRendererNotifier(ctx)
+    const popoverWc = makeWebContents()
+    const popoverView = { webContents: popoverWc } as unknown as Electron.WebContentsView
+
+    notifier.popoverInit(popoverView, { hello: 1 })
+    expect(popoverWc.send).toHaveBeenCalledWith(PopoverChannel.Init, { hello: 1 })
+
+    popoverWc.destroyed = true
+    notifier.popoverInit(popoverView, { hello: 2 })
+    expect(popoverWc.send).toHaveBeenCalledTimes(1)
+  })
+
+  it('editorOpenFile: sends the open-in-editor payload to the main window while alive', () => {
+    const mainWindow = makeBrowserWindow()
+    const ctx = {
+      windows: { mainWindow: mainWindow as unknown as Electron.BrowserWindow },
+      views: { getSettingsWebContents: () => null },
+    }
+    const notifier = createRendererNotifier(ctx)
+
+    notifier.editorOpenFile({ path: 'pages/home/home.js', line: 12, column: 3 })
+    expect(mainWindow.webContents.send).toHaveBeenCalledTimes(1)
+    expect(mainWindow.webContents.send).toHaveBeenCalledWith(
+      EditorChannel.OpenFile,
+      { path: 'pages/home/home.js', line: 12, column: 3 },
+    )
+
+    // Destroyed main window short-circuits — the console→editor pipeline can
+    // fire after a project/window close.
+    mainWindow.destroyed = true
+    expect(() => notifier.editorOpenFile({ path: 'app.js' })).not.toThrow()
+    expect(mainWindow.webContents.send).toHaveBeenCalledTimes(1)
+  })
+})

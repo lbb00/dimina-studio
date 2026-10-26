@@ -1,0 +1,202 @@
+/**
+ * Disposable lifecycle regression for UpdateManager.
+ *
+ * Asserts the construct-time registrations (3 ipcMain handlers + 2 timers)
+ * and that dispose() cleans every one of them up. Real fetches are avoided
+ * by stubbing the UpdateChecker; real Electron is mocked.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+
+// ── Electron stub (hoisted so vi.mock factory can reference it) ─────────
+const stub = vi.hoisted(() => {
+  type Handler = (...args: unknown[]) => unknown
+  const ipcHandlers = new Map<string, Handler>()
+  const ipcMainStub = {
+    handle: vi.fn((channel: string, fn: Handler) => {
+      ipcHandlers.set(channel, fn)
+    }),
+    removeHandler: vi.fn((channel: string) => {
+      ipcHandlers.delete(channel)
+    }),
+    on: vi.fn(),
+    removeListener: vi.fn(),
+  }
+  const appStub = {
+    getVersion: vi.fn(() => '1.0.0'),
+    quit: vi.fn(),
+    on: vi.fn(),
+    removeListener: vi.fn(),
+  }
+  const shellStub = { openPath: vi.fn(async () => '') }
+  return { ipcHandlers, ipcMainStub, appStub, shellStub }
+})
+
+const { ipcHandlers, ipcMainStub } = stub
+
+vi.mock('electron', () => ({
+  app: stub.appStub,
+  ipcMain: stub.ipcMainStub,
+  shell: stub.shellStub,
+  BrowserWindow: class {},
+  webContents: { getAllWebContents: () => [] },
+  nativeImage: { createFromPath: () => ({}) },
+}))
+
+import type { UpdateChecker, UpdateInfo } from '../../../shared/types.js'
+import { UpdateChannel } from '../../../shared/ipc-channels-overlays.js'
+import { UpdateManager } from './update-manager.js'
+
+const CHANNELS = [UpdateChannel.Check, UpdateChannel.Download, UpdateChannel.Install]
+
+function makePanelDeps() {
+  return { showUpdatePanel: vi.fn(), notifyDownloadProgress: vi.fn(), hideUpdatePanel: vi.fn() }
+}
+
+function makeChecker(info: UpdateInfo | null = null): UpdateChecker {
+  return {
+    checkForUpdates: vi.fn(async () => info),
+    downloadUpdate: vi.fn(async () => '/tmp/fake.dmg'),
+  }
+}
+
+beforeEach(() => {
+  ipcHandlers.clear()
+  ipcMainStub.handle.mockClear()
+  ipcMainStub.removeHandler.mockClear()
+  vi.useFakeTimers()
+})
+
+afterEach(() => {
+  vi.useRealTimers()
+  vi.clearAllMocks()
+})
+
+describe('UpdateManager lifecycle', () => {
+  it('registers three ipcMain handlers on construct', async () => {
+    const m = new UpdateManager({ checker: makeChecker(), ...makePanelDeps() })
+    for (const ch of CHANNELS) {
+      expect(ipcHandlers.has(ch)).toBe(true)
+    }
+    expect(ipcMainStub.handle).toHaveBeenCalledTimes(3)
+    await m.dispose()
+  })
+
+  it('schedules an initial timeout and a periodic interval', async () => {
+    const setTimeoutSpy = vi.spyOn(globalThis, 'setTimeout')
+    const setIntervalSpy = vi.spyOn(globalThis, 'setInterval')
+    const m = new UpdateManager({ checker: makeChecker(), ...makePanelDeps() })
+
+    expect(setTimeoutSpy).toHaveBeenCalledTimes(1)
+    expect(setIntervalSpy).toHaveBeenCalledTimes(1)
+    expect(vi.getTimerCount()).toBe(2)
+
+    await m.dispose()
+  })
+
+  it('dispose() removes all three handlers', async () => {
+    const m = new UpdateManager({ checker: makeChecker(), ...makePanelDeps() })
+    await m.dispose()
+
+    for (const ch of CHANNELS) {
+      expect(ipcMainStub.removeHandler).toHaveBeenCalledWith(ch)
+      expect(ipcHandlers.has(ch)).toBe(false)
+    }
+  })
+
+  it('dispose() clears both timers so no callbacks fire afterwards', async () => {
+    const clearTimeoutSpy = vi.spyOn(globalThis, 'clearTimeout')
+    const clearIntervalSpy = vi.spyOn(globalThis, 'clearInterval')
+
+    const checker = makeChecker()
+    const m = new UpdateManager({
+      checker,
+      ...makePanelDeps(),
+      checkInterval: 10_000,
+      initialDelay: 1_000,
+    })
+
+    await m.dispose()
+
+    expect(clearTimeoutSpy).toHaveBeenCalled()
+    expect(clearIntervalSpy).toHaveBeenCalled()
+    expect(vi.getTimerCount()).toBe(0)
+
+    // Advance well past both intervals — nothing should fire.
+    vi.advanceTimersByTime(60_000)
+    expect(checker.checkForUpdates).not.toHaveBeenCalled()
+  })
+
+  it('supports construct → dispose → construct → dispose cycles', async () => {
+    for (let i = 0; i < 2; i++) {
+      const m = new UpdateManager({ checker: makeChecker(), ...makePanelDeps() })
+      expect(ipcHandlers.size).toBe(3)
+      await m.dispose()
+      expect(ipcHandlers.size).toBe(0)
+    }
+    expect(ipcMainStub.handle).toHaveBeenCalledTimes(6)
+    expect(ipcMainStub.removeHandler).toHaveBeenCalledTimes(6)
+  })
+
+  it('dispose() before any timer fires leaves the checker untouched', async () => {
+    const checker = makeChecker()
+    const m = new UpdateManager({
+      checker,
+      ...makePanelDeps(),
+      checkInterval: 5_000,
+      initialDelay: 500,
+    })
+    await m.dispose()
+    vi.advanceTimersByTime(30_000)
+    expect(checker.checkForUpdates).not.toHaveBeenCalled()
+  })
+
+  it('dispose() while a checkAndNotify() tick is already in flight stops it from calling showUpdatePanel', async () => {
+    // clearInterval/clearTimeout only stop FUTURE ticks; a tick whose timer
+    // callback already fired (and is now suspended on `await this.check()`)
+    // has no timer left to cancel it. dispose() must still be able to
+    // silence that in-flight tick's continuation.
+    let resolveCheck: (info: UpdateInfo | null) => void = () => {}
+    const pending = new Promise<UpdateInfo | null>((resolve) => {
+      resolveCheck = resolve
+    })
+    const checker: UpdateChecker = {
+      checkForUpdates: vi.fn(() => pending),
+      downloadUpdate: vi.fn(async () => '/tmp/fake.dmg'),
+    }
+    const deps = makePanelDeps()
+    const m = new UpdateManager({
+      checker,
+      ...deps,
+      checkInterval: 10_000,
+      initialDelay: 500,
+    })
+
+    await vi.advanceTimersByTimeAsync(500)
+    expect(checker.checkForUpdates).toHaveBeenCalledTimes(1)
+
+    // The timer fired and checkAndNotify() is now suspended awaiting the
+    // checker — dispose it before that await settles.
+    await m.dispose()
+
+    resolveCheck({ version: '2.0.0', downloadUrl: 'https://example.com/2.0.0.dmg' })
+    for (let k = 0; k < 5; k++) await Promise.resolve()
+
+    expect(deps.showUpdatePanel).not.toHaveBeenCalled()
+  })
+
+})
+
+describe('UpdateManager: UpdateChannel.Close forwards to hideUpdatePanel', () => {
+  it('registers an ipcMain listener that calls hideUpdatePanel — without it, a closed dialog stays presented forever', async () => {
+    const deps = makePanelDeps()
+    const m = new UpdateManager({ checker: makeChecker(), ...deps })
+
+    const closeHandler = ipcMainStub.on.mock.calls.find(([ch]) => ch === UpdateChannel.Close)?.[1]
+    expect(closeHandler, 'UpdateChannel.Close must be registered via ipcMain.on').toBeDefined()
+
+    closeHandler!()
+
+    expect(deps.hideUpdatePanel).toHaveBeenCalledTimes(1)
+    await m.dispose()
+  })
+})

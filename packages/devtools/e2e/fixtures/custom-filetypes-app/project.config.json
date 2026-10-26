@@ -1,0 +1,5 @@
+{
+  "appid": "devtools_altml_fixture",
+  "projectname": "devtools-altml-fixture",
+  "description": "Fixture mini-app whose template/style/viewScript use the custom .altml/.altss/.alts extensions, exercising WorkbenchAppConfig.fileTypes through both compilation and the editor."
+}

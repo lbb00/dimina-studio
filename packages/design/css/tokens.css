@@ -1,0 +1,164 @@
+/* shadcn-compatible semantic tokens for Tailwind CSS v3 consumers. */
+
+/* Dark is the default. A host can force it with `<html class="dark">`. */
+:where(:root) {
+  --background: oklch(0.145 0 0);
+  --foreground: oklch(0.985 0 0);
+  --card: oklch(0.205 0 0);
+  --card-foreground: oklch(0.985 0 0);
+  --popover: oklch(0.205 0 0);
+  --popover-foreground: oklch(0.985 0 0);
+  --primary: oklch(0.922 0 0);
+  --primary-foreground: oklch(0.205 0 0);
+  --secondary: oklch(0.269 0 0);
+  --secondary-foreground: oklch(0.985 0 0);
+  --muted: oklch(0.269 0 0);
+  --muted-foreground: oklch(0.708 0 0);
+  --accent: oklch(0.269 0 0);
+  --accent-foreground: oklch(0.985 0 0);
+  --destructive: oklch(0.704 0.191 22.216);
+  --destructive-foreground: oklch(0 0 0);
+  --border: oklch(1 0 0 / 0.1);
+  --input: var(--muted-foreground);
+  --ring: var(--muted-foreground);
+  --radius: 8px;
+
+  --sidebar: oklch(0.205 0 0);
+  --sidebar-foreground: oklch(0.985 0 0);
+  --sidebar-primary: oklch(0.488 0.243 264.376);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: var(--accent);
+  --sidebar-accent-foreground: var(--accent-foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
+
+  --success: oklch(0.74 0.14 145.66);
+  --warning: oklch(0.76 0.14 68.06);
+  --info: oklch(0.8 0.17 262);
+  --success-soft: oklch(0.3668 0.0791 148.38);
+  --warning-soft: oklch(0.3826 0.08 69.36);
+  --info-soft: oklch(0.3295 0.1126 264.04);
+  --destructive-soft: oklch(0.3954 0.1212 15.59);
+  --color-accent: var(--primary);
+  --color-accent-hover: var(--primary);
+  --color-code-blue: oklch(0.837 0.102 222);
+  --color-code-orange: oklch(0.76 0.091 39);
+  --color-code-label: oklch(0.76 0 0);
+  --color-code-number: oklch(0.75 0.078 132);
+  --color-code-keyword: oklch(0.75 0.11 240);
+  --color-status-warn: var(--warning);
+  --color-status-error: oklch(0.835 0.19 22.216);
+  --color-status-success: var(--success);
+  --color-status-ready: var(--primary);
+  --color-danger-bg: var(--destructive-soft);
+  --color-warn-bg: var(--warning-soft);
+  --color-warn-border: oklch(0.7 0.16 75 / 0.3);
+  --color-overlay: oklch(0 0 0 / 0.45);
+  --color-overlay-heavy: oklch(0 0 0 / 0.7);
+
+  --font-family: ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, 'PingFang SC', 'Hiragino Sans GB', 'Microsoft YaHei', sans-serif;
+  --font-family-mono: 'Menlo', 'Consolas', monospace;
+  --font-size-xs: 11px;
+  --font-size-sm: 12px;
+  --font-size-base: 13px;
+  --font-size-md: 14px;
+  --font-size-lg: 16px;
+  --radius-sm: calc(var(--radius) - 4px);
+  --radius-md: calc(var(--radius) - 2px);
+  --radius-lg: var(--radius);
+  --radius-xl: calc(var(--radius) + 4px);
+  --radius-2xl: calc(var(--radius) + 8px);
+  --radius-3xl: calc(var(--radius) + 12px);
+  --scrollbar-size: 6px;
+  --scrollbar-thumb: var(--muted-foreground);
+}
+
+@media (prefers-color-scheme: light) {
+  :where(:root:not(.dark)) {
+    --background: oklch(1 0 0);
+    --foreground: oklch(0.145 0 0);
+    --card: oklch(1 0 0);
+    --card-foreground: oklch(0.145 0 0);
+    --popover: oklch(1 0 0);
+    --popover-foreground: oklch(0.145 0 0);
+    --primary: oklch(0.205 0 0);
+    --primary-foreground: oklch(0.985 0 0);
+    --secondary: oklch(0.97 0 0);
+    --secondary-foreground: oklch(0.205 0 0);
+    --muted: oklch(0.97 0 0);
+    --muted-foreground: oklch(0.556 0 0);
+    --accent: oklch(0.97 0 0);
+    --accent-foreground: oklch(0.205 0 0);
+    --destructive: oklch(0.577 0.245 27.325);
+    --destructive-foreground: oklch(1 0 0);
+    --border: oklch(0.922 0 0);
+    --success: oklch(0.5 0.14 145.66);
+    --warning: oklch(0.545 0.14 68.06);
+    --info: oklch(0.53 0.17 262);
+    --success-soft: oklch(0.9553 0.0345 146.63);
+    --warning-soft: oklch(0.9705 0.0288 82.6);
+    --info-soft: oklch(0.9535 0.0219 263.19);
+    --destructive-soft: oklch(0.9555 0.022 24.44);
+    --sidebar: oklch(0.985 0 0);
+    --sidebar-foreground: oklch(0.145 0 0);
+    --sidebar-primary: oklch(0.205 0 0);
+    --sidebar-primary-foreground: oklch(0.985 0 0);
+    --sidebar-accent: var(--accent);
+    --sidebar-accent-foreground: var(--accent-foreground);
+    --sidebar-border: var(--border);
+    --sidebar-ring: var(--ring);
+    --color-code-blue: oklch(0.5 0.16 245);
+    --color-code-orange: oklch(0.47 0.19 30);
+    --color-code-label: oklch(0.535 0 0);
+    --color-code-number: oklch(0.52 0.16 145);
+    --color-code-keyword: oklch(0.48 0.23 285);
+    --color-status-error: oklch(0.54 0.19 22.216);
+    --color-warn-border: oklch(0.7 0.16 75 / 0.35);
+    --color-overlay: oklch(0 0 0 / 0.3);
+    --color-overlay-heavy: oklch(0 0 0 / 0.6);
+  }
+}
+
+:where(:root.light) {
+  --background: oklch(1 0 0);
+  --foreground: oklch(0.145 0 0);
+  --card: oklch(1 0 0);
+  --card-foreground: oklch(0.145 0 0);
+  --popover: oklch(1 0 0);
+  --popover-foreground: oklch(0.145 0 0);
+  --primary: oklch(0.205 0 0);
+  --primary-foreground: oklch(0.985 0 0);
+  --secondary: oklch(0.97 0 0);
+  --secondary-foreground: oklch(0.205 0 0);
+  --muted: oklch(0.97 0 0);
+  --muted-foreground: oklch(0.556 0 0);
+  --accent: oklch(0.97 0 0);
+  --accent-foreground: oklch(0.205 0 0);
+  --destructive: oklch(0.577 0.245 27.325);
+  --destructive-foreground: oklch(1 0 0);
+  --border: oklch(0.922 0 0);
+  --success: oklch(0.5 0.14 145.66);
+  --warning: oklch(0.545 0.14 68.06);
+  --info: oklch(0.53 0.17 262);
+  --success-soft: oklch(0.9553 0.0345 146.63);
+  --warning-soft: oklch(0.9705 0.0288 82.6);
+  --info-soft: oklch(0.9535 0.0219 263.19);
+  --destructive-soft: oklch(0.9555 0.022 24.44);
+  --sidebar: oklch(0.985 0 0);
+  --sidebar-foreground: oklch(0.145 0 0);
+  --sidebar-primary: oklch(0.205 0 0);
+  --sidebar-primary-foreground: oklch(0.985 0 0);
+  --sidebar-accent: var(--accent);
+  --sidebar-accent-foreground: var(--accent-foreground);
+  --sidebar-border: var(--border);
+  --sidebar-ring: var(--ring);
+  --color-code-blue: oklch(0.5 0.16 245);
+  --color-code-orange: oklch(0.47 0.19 30);
+  --color-code-label: oklch(0.535 0 0);
+  --color-code-number: oklch(0.52 0.16 145);
+  --color-code-keyword: oklch(0.48 0.23 285);
+  --color-status-error: oklch(0.54 0.19 22.216);
+  --color-warn-border: oklch(0.7 0.16 75 / 0.35);
+  --color-overlay: oklch(0 0 0 / 0.3);
+  --color-overlay-heavy: oklch(0 0 0 / 0.6);
+}

@@ -1,0 +1,49 @@
+# dimina-studio Engineering Rules
+
+## Source of truth and repair layer
+
+- 先判断问题属于上游框架/编译器/运行时/native，还是 kit 的 devtools/devkit/simulator/compiler 适配层。框架语义不得靠 demo、fixture 或业务代码补丁解决。
+- 小程序外部行为以微信官方文档、官方类型和可复现行为为准。dimina 的类型与实现是待核实证据，不是外部语义标准；跨端差异逐端检查，不由一端推断另一端。
+- 禁止把路径、平台目录、字段名、固定延时、固定尺寸或偏移写死来解决单一 case。优先从配置、编译产物、运行状态、平台能力或官方规范推导。
+- 涉及上游语义或陌生机制时加载 `upstream-semantics` skill。
+
+## Design invariants
+
+- 数据模型必须承载真实关系；同一状态、判断或资源只有一个权威 owner。同类 bug 第二次出现时修统一入口或抽象，不继续增加特判。
+- 状态标记在事实发生时同步更新。可被新请求替代的异步结果使用单调 generation/epoch；迟到结果不重放、不复活旧 owner、不产生副作用。
+- owner 销毁时主动推终态并清理资源。监听器、worker、窗口和模拟器使用账本与精确计数验证回到基线。
+- 不用 `setTimeout`、多次 `nextTick` 或固定 animation frame 掩盖 service/render、页面栈或布局时序问题。定位用临时日志在修复完成时移除，只保留必要异常和长期可观测点。
+- 修改状态机、复用对象、导航、生命周期或资源 owner 时加载 `state-lifecycle` skill。
+
+## Verification and review
+
+- 每个确认的问题都要留下能先失败再通过的回归测试。框架/渲染改动还要覆盖原始复现、相邻组件和同链路历史回归点。
+- 断言源码文本（包含/不包含某字符串）只锁结构，不计入行为覆盖。单组件内的纵深语义用例也不能替代跨组件、跨包边界的组合路径用例；冒泡、拦截和事件归属各留一条常设回归。
+- UI/运行时问题必须验证最终画面/DOM和真实用户路径；“构建成功、无异常”不能证明内容正确。导航、页面栈和生命周期改动必须包含操作后的第二次交互。
+- “所有端/入口/调用方”先列成员全集，每个成员提供自己的 `file:line` 或运行证据；未验证成员不得用对称推断关闭。
+- 改变某类事件、状态或产物“由谁产生”时，成员全集按生产者与消费者枚举，不按改动所在的目录或包枚举：先全仓搜同一事物的所有派发点和所有仍依赖旧通道的代码，清单写进 PR。这类回归落在 diff 之外一行未改的文件里，只读 diff 的评审看不见。
+- review 按风险选择，不按轮数。多端、跨进程、导航和生命周期改动加载 `dimina-review`；低风险 UI/文案改动不强制多轮对抗。
+- 运行时和视觉验收加载 `runtime-validation`。
+
+## Repository safety
+
+- `dimina/` 是 submodule。未经开发者明确批准不得修改其内容；优先在 `packages/devtools/`、`packages/devkit/` 或其他 kit 适配层解决。获批后遵循 `dimina/AGENTS.md` 和 `dimina/docs/Experience-Review.md`。
+- 开工先检查当前 git 状态、相关源码、日志、编译产物和 submodule HEAD；不覆盖现有未提交改动，不用 stash/checkout 当前工作树制造干净环境。
+- worktree/沙箱构建、native-host/compiler 产物或 e2e 环境问题加载 `dimina-studio-worktree-build`。
+
+## Gates and comments
+
+- 提交或开 PR 前运行 `./scripts/gate.sh`；需要目标验证时按风险运行受影响包的 lint/typecheck/test。新增或扩写 `packages/*/src/**/*.{ts,tsx}` 时遵守 `pawl.yaml` 的 file-length 阈值（当前 500 行）。禁止用管道末端状态判成败、静默 skip、或重录 baseline 让门禁通过。
+- gate、pawl、reporter 和干净基线细节加载 `dimina-gate`。
+- 注释和测试标题只描述当前原因、不变量和边界；不写作者/模型、review 轮次、阶段编号或过期开发历史。详细规范加载 `dimina-comments`。
+
+<!-- BEGIN:turborepo-agent-rules -->
+
+# This is NOT the Turborepo you know
+
+Turborepo configuration, task behavior, and CLI commands can vary between installed versions and may differ from your training data. Resolve the `turbo` package from this file's directory or relevant workspace; in monorepos, it may not be visible from the repository root. For example, run `node -p "require.resolve('turbo/package.json')"` from a workspace that depends on `turbo`.
+
+Read `docs/README.md` inside that installed package first, then read the relevant pages from its `docs/` directory before changing Turborepo configuration or commands. Heed deprecation notices. These bundled docs match the installed package version and are available without network access.
+
+This block is written and re-added by `turbo` before repository-scoped commands when an AI agent is detected. In the Turborepo source repository, its template is defined in `crates/turborepo-cli/src/cli/agent_guidance.rs`. Removing the managed block while updates are enabled means a later qualifying invocation will add it again. Set `"agentGuidance": false` in the root `turbo.json` or `turbo.jsonc` to opt out; this does not remove an existing block. Keep the block committed with your work to avoid an uncommitted change on the next agent invocation.
+<!-- END:turborepo-agent-rules -->

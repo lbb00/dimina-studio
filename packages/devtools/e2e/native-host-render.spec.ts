@@ -1,0 +1,297 @@
+/**
+ * E2E: devtools' own PANEL + automation-server infrastructure against the
+ * native-host render path (DeviceShell + render-host <webview>s) — the WXML
+ * tree panel, the AppData panel, the Storage panel, element inspection, and
+ * console-forward-to-automation-WS. These are devtools-registered IPC
+ * channels / WS protocol surface, not part of dimina-electron-runtime's own
+ * bridge, so they stay here even though the underlying render path they
+ * exercise is runtime-owned.
+ *
+ * The genuinely runtime-owned behaviour this file used to also cover
+ * (DeviceShell mount + render-host webview src, Page.getData via the AppData
+ * accumulator, App.getCurrentPage/callWxMethod switchTab) moved to
+ * packages/dimina-electron-runtime/e2e/native-host-render.spec.ts.
+ */
+import { test, expect, _electron, type ElectronApplication, type Page as PwPage } from '@playwright/test'
+import path from 'path'
+import fs from 'fs'
+import { fileURLToPath } from 'url'
+import { WebSocket } from 'ws'
+import {
+  openProjectInUI,
+  waitForSimulatorWebview,
+  closeProject,
+  ipcInvoke,
+  pollUntil,
+  evalInWebContentsByUrl,
+  RENDER_GUEST_URL_MARKER,
+  findMainWindow,
+} from './helpers'
+import {
+  AutomationChannel,
+  SimulatorAppDataChannel,
+  SimulatorElementChannel,
+  SimulatorStorageChannel,
+  SimulatorWxmlChannel,
+} from '../src/shared/ipc-channels'
+
+// NOTE: scope DIMINA_NATIVE_HOST to THIS spec's electron launch (below), never
+// `process.env` — a module-top mutation poisons the shared --workers=1 runner,
+// flipping every other spec into native-host mode (panel ripple → mass failures).
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+const FIXTURE_DIR = path.resolve(__dirname, 'fixtures', 'tabbar-app')
+
+let electronApp: ElectronApplication
+let mainWindow: PwPage
+let workbench: PwPage
+let autoPort = 0
+
+// One-shot JSON-RPC call to the miniprogram-automator WebSocket server. Drives
+// the SAME automation handlers the SDK uses, so it exercises the native-host
+// automation pipeline (App/Page/Element → evalInActivePage → render guest /
+// serviceWc) end-to-end. Mirrors the helper in automator-compat.spec.ts.
+function wsCall<T = Record<string, unknown>>(
+  method: string,
+  params: Record<string, unknown> = {},
+  timeoutMs = 12000,
+): Promise<T> {
+  return new Promise((resolve, reject) => {
+    const ws = new WebSocket(`ws://127.0.0.1:${autoPort}`)
+    const timer = setTimeout(() => { ws.close(); reject(new Error(`wsCall ${method} timed out`)) }, timeoutMs)
+    ws.on('open', () => ws.send(JSON.stringify({ id: 'nh1', method, params })))
+    ws.on('message', (raw) => {
+      let msg: { id?: string; result?: unknown; error?: { message?: string } }
+      try { msg = JSON.parse(String(raw)) } catch { return }
+      if (msg.id !== 'nh1') return
+      clearTimeout(timer)
+      ws.close()
+      if (msg.error) reject(new Error(msg.error.message || 'rpc error'))
+      else resolve(msg.result as T)
+    })
+    ws.on('error', (err) => { clearTimeout(timer); reject(err) })
+  })
+}
+
+test.describe('native-host render path e2e', () => {
+  test.describe.configure({ mode: 'serial' })
+  test.setTimeout(180_000)
+
+  test.beforeAll(async () => {
+    const appPath = path.resolve(__dirname, 'electron-entry.js')
+    const userDataDir = path.resolve(
+      process.env.DIMINA_DEVTOOLS_DATA_DIR
+        ?? path.resolve(__dirname, '..', 'node_modules', '.cache', 'devtools-e2e'),
+      'userdata',
+      `nh-render-${process.pid}`,
+    )
+    fs.mkdirSync(userDataDir, { recursive: true })
+
+    electronApp = await _electron.launch({
+      args: [appPath, 'auto', '--auto-port', '0', `--user-data-dir=${userDataDir}`],
+      env: { ...process.env, NODE_ENV: 'test', DIMINA_NATIVE_HOST: '1', DIMINA_E2E_USER_DATA_DIR: userDataDir },
+    })
+
+    mainWindow = await findMainWindow(electronApp)
+    await mainWindow.waitForLoadState('domcontentloaded')
+
+    await electronApp.evaluate(async ({ BrowserWindow }) => {
+      const win = BrowserWindow.getAllWindows()[0]
+      if (win && !win.isVisible()) {
+        await new Promise<void>((resolve) => {
+          win.once('show', resolve)
+          setTimeout(resolve, 5000)
+        })
+      }
+      if (win) {
+        win.setPosition(-2000, -2000)
+        win.blur()
+      }
+    })
+
+    autoPort = await pollUntil(
+      () => ipcInvoke<number | null>(mainWindow, AutomationChannel.GetPort),
+      (val) => typeof val === 'number' && val > 0,
+      10000,
+      100,
+    ) as number
+
+    workbench = await openProjectInUI(electronApp, FIXTURE_DIR, { waitMs: 20000 })
+    await waitForSimulatorWebview(electronApp)
+  })
+
+  test.afterAll(async () => {
+    await closeProject(electronApp).catch(() => {})
+    await electronApp?.close().catch(() => {})
+  })
+
+  // ── Right-panel + storage parity under native-host ──────────────────────────
+  // These drive the SAME main-process IPC the renderer panels consume, so they
+  // validate the whole native-host data pipeline end-to-end in real Electron:
+  // WXML (renderWc.executeJavaScript → __diminaRenderInspect), AppData (the
+  // service→render setData tap), and Storage (the unified service-host file://
+  // store). The default dimina-fe path doesn't register these channels.
+
+  // The simulator now mounts as a top-level WebContentsView (Option A), so its
+  // webContents is NOT a webview guest and CAN host DeviceShell's per-page
+  // render-host `<webview>`s — the pages render, so these panels have a real
+  // active page to read end-to-end.
+  test('WXML panel is populated from the active render guest', async () => {
+    // The WXML service pulls the tree from the active render guest via the
+    // injected inspector; it's ready once the page DOM (its Vue tree) mounts.
+    const tree = await pollUntil(
+      () => ipcInvoke<{ tagName?: string } | null>(workbench, SimulatorWxmlChannel.GetSnapshot).catch(() => null),
+      (t) => !!t && typeof t.tagName === 'string',
+      30000,
+      400,
+    )
+    expect(tree, 'WXML GetSnapshot should return a non-null tree under native-host').toBeTruthy()
+    expect(typeof (tree as { tagName?: string }).tagName).toBe('string')
+  })
+
+  test('AppData panel is populated from the service→render setData tap', async () => {
+    const snap = await pollUntil(
+      () => ipcInvoke<{ bridges?: unknown[] } | null>(workbench, SimulatorAppDataChannel.GetSnapshot).catch(() => null),
+      (s) => !!s && Array.isArray(s.bridges) && s.bridges.length >= 1,
+      30000,
+      400,
+    )
+    expect(
+      Array.isArray((snap as { bridges?: unknown[] })?.bridges) && (snap as { bridges: unknown[] }).bridges.length,
+      'AppData GetSnapshot should report at least one page bridge',
+    ).toBeGreaterThanOrEqual(1)
+  })
+
+  test('Storage panel reads/writes the service-host store', async () => {
+    const prefix = await ipcInvoke<string>(workbench, SimulatorStorageChannel.GetActivePrefix)
+    expect(prefix, 'active storage prefix should resolve under native-host').toBeTruthy()
+    const key = `${prefix}__e2e_native_storage`
+
+    const set = await ipcInvoke<{ ok: boolean }>(workbench, SimulatorStorageChannel.Set, { key, value: 'native-1' })
+    expect(set?.ok, 'Set should succeed against the service-host store').toBe(true)
+
+    const items = await pollUntil(
+      () => ipcInvoke<Array<{ key: string; value: string }>>(workbench, SimulatorStorageChannel.GetSnapshot).catch(() => []),
+      (arr) => Array.isArray(arr) && arr.some((it) => it.key === key && it.value === 'native-1'),
+      10000,
+      300,
+    )
+    expect(items.some((it) => it.key === key && it.value === 'native-1'), 'written key should appear in the snapshot').toBe(true)
+  })
+
+  // ── Automation parity under native-host (raw JSON-RPC over the WS server) ────
+  // These drive the real miniprogram-automator handlers, which under native-host
+  // route through evalInActivePage → the active render-host guest (Page/Element)
+  // or serviceWc.executeJavaScript('wx.*') (nav). They prove the automation +
+  // AppData + console pipelines work against the real rendered page, not the
+  // default dimina-fe iframe (which native-host doesn't use).
+
+  test('element inspection resolves a real element rect from the active render guest', async () => {
+    // The render inspector (render-inspect IIFE in the guest main world) backs
+    // both the WXML tree and element highlight. Walk the tree for sids, then
+    // highlight until one maps to a real, laid-out element.
+    const tree = await pollUntil(
+      () => ipcInvoke<{ tagName?: string; sid?: string; children?: unknown[] } | null>(
+        workbench, SimulatorWxmlChannel.GetSnapshot,
+      ).catch(() => null),
+      (t) => !!t && typeof t.tagName === 'string',
+      30000,
+      400,
+    )
+    const sids: string[] = []
+    const walk = (n: { sid?: string; children?: unknown[] } | null | undefined): void => {
+      if (!n) return
+      if (typeof n.sid === 'string' && n.sid) sids.push(n.sid)
+      for (const c of (n.children ?? []) as Array<{ sid?: string; children?: unknown[] }>) walk(c)
+    }
+    walk(tree as { sid?: string; children?: unknown[] })
+    expect(sids.length, 'WXML tree should expose sids to inspect').toBeGreaterThan(0)
+
+    let hit: { rect?: { width?: number } } | null = null
+    for (const sid of sids.slice(0, 30)) {
+      const r = await ipcInvoke<{ rect?: { width?: number } } | null>(
+        workbench, SimulatorElementChannel.Inspect, sid,
+      ).catch(() => null)
+      if (r && r.rect) { hit = r; break }
+    }
+    expect(hit, 'at least one sid should highlight a real element via the render inspector').toBeTruthy()
+    expect(typeof hit!.rect!.width).toBe('number')
+    await ipcInvoke(workbench, SimulatorElementChannel.Clear).catch(() => {})
+  })
+
+  test('App.getCurrentPage + Page.getElement/Element.tap reach the render guest', async () => {
+    const cur = await pollUntil(
+      () => wsCall<{ path?: string }>('App.getCurrentPage').catch(() => null),
+      (r) => !!r && typeof r.path === 'string' && r.path.length > 0,
+      20000,
+      500,
+    )
+    expect(cur?.path, 'App.getCurrentPage should report the active native page path').toContain('pages/')
+
+    // Page.getElement('body') reads the render guest's DOM via evalInActivePage.
+    const el = await wsCall<{ elementId?: string; tagName?: string }>('Page.getElement', { selector: 'body' })
+    expect(el.tagName).toBe('body')
+    expect(el.elementId, 'getElement should register an elementId').toBeTruthy()
+
+    // Element.tap round-trips through evalInElement → renderWc (no throw).
+    await wsCall('Element.tap', { elementId: el.elementId })
+  })
+
+  test('render-guest console.log is forwarded to the automation WS as App.logAdded', async () => {
+    const marker = `__e2e_native_console_${Date.now()}__`
+    const ws = new WebSocket(`ws://127.0.0.1:${autoPort}`)
+    const logs: Array<{ args?: unknown[] }> = []
+    await new Promise<void>((resolve, reject) => {
+      ws.once('open', () => resolve())
+      ws.once('error', reject)
+    })
+    ws.on('message', (raw) => {
+      try {
+        const m = JSON.parse(String(raw)) as { method?: string; params?: { args?: unknown[] } }
+        if (m.method === 'App.logAdded' && m.params) logs.push(m.params)
+      } catch { /* ignore */ }
+    })
+    // Let the server register this client before emitting.
+    await new Promise((r) => setTimeout(r, 300))
+
+    // Fire console.log inside the active render-host guest (__frame__.html). Its
+    // preload monkeypatches console → bridge-router → ctx.guestConsole → broadcast.
+    await evalInWebContentsByUrl(electronApp, RENDER_GUEST_URL_MARKER, `console.log(${JSON.stringify(marker)}); 1`)
+
+    const found = await pollUntil(
+      async () => logs.some((p) => JSON.stringify(p.args ?? []).includes(marker)),
+      (ok) => ok === true,
+      15000,
+      300,
+    )
+    ws.close()
+    expect(found, 'render-host console.log should reach the automation WS via the native-host console tap').toBe(true)
+  })
+
+  test('layout: the native simulator WebContentsView is live with the default zoom', async () => {
+    // The simulator is a top-level WebContentsView (Option A) that carries the
+    // default 85% zoom factor (setZoomFactor wired, not broken). main applies the
+    // factor only when the renderer publishes a VISIBLE simulator rect; in the
+    // off-screen automation window that first publish can lag, so poll, and if it
+    // has not landed force a re-measure via a real hide/show of the simulator
+    // panel. Pixel-position fidelity (bezel inset, scroll tracking) is visual QA.
+    const zoomOf = () =>
+      electronApp.evaluate(({ webContents }) => {
+        const sim = webContents.getAllWebContents().find((wc) => wc.getURL().includes('simulator.html'))
+        return sim ? sim.getZoomFactor() : null
+      })
+    const settled = (z: number | null): boolean => z !== null && Math.abs(z - 0.85) < 0.01
+
+    let zoom = await pollUntil(zoomOf, settled, 8000, 300).catch(() => null)
+    if (!settled(zoom)) {
+      const toggle = workbench.locator('[data-testid="layout-toolbar-toggle-simulator"]')
+      await toggle.click()
+      await workbench.waitForTimeout(500)
+      await toggle.click()
+      zoom = await pollUntil(zoomOf, settled, 8000, 300).catch(() => null)
+    }
+
+    expect(zoom, 'native simulator WebContentsView should be present').not.toBeNull()
+    expect(Math.abs((zoom as number) - 0.85), 'default zoom factor should be ~0.85').toBeLessThan(0.01)
+  })
+})

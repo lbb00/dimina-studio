@@ -1,0 +1,183 @@
+{
+  "name": "@dimina-studio/devtools",
+  "version": "0.5.0",
+  "description": "Dimina DevTools - modular developer tools for mini app debugging",
+  "keywords": [
+    "dimina",
+    "mini-app",
+    "miniprogram",
+    "devtools",
+    "electron",
+    "debugger",
+    "inspector",
+    "mcp"
+  ],
+  "license": "MIT",
+  "author": "lbb00",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/lbb00/dimina-studio.git",
+    "directory": "packages/devtools"
+  },
+  "bugs": {
+    "url": "https://github.com/lbb00/dimina-studio/issues"
+  },
+  "homepage": "https://github.com/lbb00/dimina-studio/tree/main/packages/devtools#readme",
+  "files": [
+    "dist",
+    "!dist/**/*.js.map",
+    "!dist/**/*.d.ts.map",
+    "templates",
+    "README.md",
+    "LICENSE"
+  ],
+  "main": "dist/main/api.js",
+  "types": "dist/main/api.d.ts",
+  "exports": {
+    ".": "./dist/main/api.js",
+    "./launch": "./dist/main/app/launch.js",
+    "./types": "./dist/shared/types.js",
+    "./simulator-ui": "./dist/shared/simulator-ui.js",
+    "./context": "./dist/main/services/workbench-context.js",
+    "./projects-provider": "./dist/main/services/projects/index.js",
+    "./create-window": "./dist/main/windows/main-window/index.js",
+    "./paths": "./dist/main/utils/paths.js",
+    "./workbench-settings": "./dist/main/services/settings/index.js",
+    "./preload": "./dist/preload/index.js",
+    "./bootstrap": "./dist/main/app/bootstrap.js"
+  },
+  "typesVersions": {
+    "*": {
+      "launch": [
+        "dist/main/app/launch.d.ts"
+      ],
+      "types": [
+        "dist/shared/types.d.ts"
+      ],
+      "simulator-ui": [
+        "dist/shared/simulator-ui.d.ts"
+      ],
+      "context": [
+        "dist/main/services/workbench-context.d.ts"
+      ],
+      "create-window": [
+        "dist/main/windows/main-window/index.d.ts"
+      ],
+      "paths": [
+        "dist/main/utils/paths.d.ts"
+      ],
+      "workbench-settings": [
+        "dist/main/services/settings/index.d.ts"
+      ],
+      "bootstrap": [
+        "dist/main/app/bootstrap.d.ts"
+      ],
+      "preload": [
+        "dist/preload/index.d.ts"
+      ],
+      "projects-provider": [
+        "dist/main/services/projects/index.d.ts"
+      ]
+    }
+  },
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "electron dist/main/index.js",
+    "build": "pnpm build:container && pnpm build:main && pnpm build:preload && pnpm build:renderer && pnpm build:simulator && pnpm build:native-host && pnpm build:workbench",
+    "build:container": "node build-container.js",
+    "build:native-host": "node build-native-host.js",
+    "build:simulator": "vite build --config vite.config.simulator.ts",
+    "build:workbench": "node build-workbench.js",
+    "pack": "electron-builder --dir",
+    "dist": "electron-builder",
+    "verify:asar-writer": "node scripts/verify-asar-writer.js",
+    "verify:electron-locales": "node scripts/verify-electron-locales.js",
+    "verify:differential-download": "node scripts/verify-differential-download.js",
+    "prepack": "pnpm run build",
+    "build:main": "tsc -p tsconfig.main.json && esbuild src/main/index.ts --bundle --platform=node --format=esm --target=node24 --external:electron --packages=external --outfile=dist/main/index.bundle.js",
+    "build:preload": "tsc -p tsconfig.preload.json && esbuild src/preload/windows/simulator.ts --bundle --platform=node --format=cjs --sourcemap --external:electron --outfile=dist/preload/windows/simulator.js && esbuild src/preload/windows/simulator.ts --bundle --platform=node --format=cjs --sourcemap --external:electron --outfile=dist/preload/windows/simulator.cjs && esbuild src/preload/windows/main.ts --bundle --platform=node --format=cjs --sourcemap --external:electron --outfile=dist/preload/windows/main.cjs && esbuild src/preload/windows/host-toolbar-runtime.ts --bundle --platform=node --format=cjs --sourcemap --external:electron --outfile=dist/preload/windows/host-toolbar-runtime.cjs && esbuild src/preload/windows/host-sidebar-runtime.ts --bundle --platform=node --format=cjs --sourcemap --external:electron --outfile=dist/preload/windows/host-sidebar-runtime.cjs && esbuild src/preload/windows/host-dialog-runtime.ts --bundle --platform=node --format=cjs --sourcemap --external:electron --outfile=dist/preload/windows/host-dialog-runtime.cjs",
+    "build:renderer": "vite build",
+    "dev": "pnpm build && concurrently \"vite build --watch\" \"vite build --watch --config vite.config.simulator.ts\" \"tsc -p tsconfig.main.json --watch\" \"tsc -p tsconfig.preload.json --watch\" \"esbuild src/preload/windows/simulator.ts --bundle --platform=node --format=cjs --sourcemap --external:electron --outfile=dist/preload/windows/simulator.js --watch\" \"esbuild src/preload/windows/simulator.ts --bundle --platform=node --format=cjs --sourcemap --external:electron --outfile=dist/preload/windows/simulator.cjs --watch\" \"esbuild src/preload/windows/main.ts --bundle --platform=node --format=cjs --sourcemap --external:electron --outfile=dist/preload/windows/main.cjs --watch\" \"esbuild src/preload/windows/host-toolbar-runtime.ts --bundle --platform=node --format=cjs --sourcemap --external:electron --outfile=dist/preload/windows/host-toolbar-runtime.cjs --watch\" \"esbuild src/preload/windows/host-sidebar-runtime.ts --bundle --platform=node --format=cjs --sourcemap --external:electron --outfile=dist/preload/windows/host-sidebar-runtime.cjs --watch\" \"esbuild src/preload/windows/host-dialog-runtime.ts --bundle --platform=node --format=cjs --sourcemap --external:electron --outfile=dist/preload/windows/host-dialog-runtime.cjs --watch\" \"electron dist/main/index.js\"",
+    "build:core": "pnpm --filter @dimina-studio/devkit build",
+    "check-types": "tsc --noEmit",
+    "lint": "eslint . --max-warnings 0",
+    "test": "vitest run --reporter=default --reporter=json --outputFile.json=test-report.json --coverage.enabled --coverage.reporter=json-summary --coverage.reportsDirectory=coverage",
+    "test:dev": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:e2e": "playwright test",
+    "test:e2e:ui": "playwright test --ui",
+    "spike:popout": "electron spike/popout/harness.js"
+  },
+  "dependencies": {
+    "@devicekit/devices": "^0.4.0",
+    "@devicekit/frame": "^0.4.0",
+    "@dimina-studio/design": "workspace:*",
+    "@dimina-studio/devkit": "workspace:*",
+    "@dimina-studio/electron-runtime": "workspace:*",
+    "@dimina-studio/inspect": "workspace:*",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "@radix-ui/react-slot": "^1.3.3",
+    "chrome-remote-interface": "^0.34.0",
+    "electron-deck": "^0.2.1",
+    "electron-updater": "6.8.10",
+    "view-anchor": "1.0.0",
+    "ws": "^8.20.0",
+    "zod": "^4.3.6"
+  },
+  "devDependencies": {
+    "@dimina-studio/eslint-config": "workspace:*",
+    "@dimina-studio/typescript-config": "workspace:*",
+    "@dimina-studio/workbench": "workspace:*",
+    "@playwright/test": "^1.59.1",
+    "@radix-ui/react-dialog": "^1.1.15",
+    "@radix-ui/react-scroll-area": "^1.2.10",
+    "@radix-ui/react-select": "^2.2.6",
+    "@radix-ui/react-separator": "^1.1.8",
+    "@radix-ui/react-switch": "^1.2.6",
+    "@radix-ui/react-tabs": "^1.1.13",
+    "@radix-ui/react-tooltip": "^1.2.8",
+    "@tanstack/react-virtual": "^3.13.24",
+    "@testing-library/jest-dom": "^6.9.1",
+    "@testing-library/react": "^16.3.2",
+    "@types/chrome-remote-interface": "^0.33.0",
+    "@types/node": "^22.10.0",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1",
+    "@types/ws": "^8.18.1",
+    "@uiw/react-json-view": "2.0.0-alpha.41",
+    "@vitejs/plugin-react": "^6.0.1",
+    "@vitest/coverage-v8": "^4.1.4",
+    "autoprefixer": "^10.5.0",
+    "class-variance-authority": "^0.7.1",
+    "clsx": "^2.1.1",
+    "cmdk": "^1.1.1",
+    "concurrently": "^9.2.1",
+    "electron": "^43.2.0",
+    "electron-builder": "^26.8.1",
+    "esbuild": "^0.28.1",
+    "eslint": "^10.2.1",
+    "globals": "^17.5.0",
+    "jsdom": "^29.0.2",
+    "lucide-react": "^1.8.0",
+    "miniprogram-automator": "^0.12.1",
+    "postcss": "^8.5.10",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "react-resizable-panels": "^4.10.0",
+    "tailwind-merge": "^2.6.0",
+    "tailwindcss": "^3.4.17",
+    "tailwindcss-animate": "^1.0.7",
+    "typescript": "5.9.2",
+    "vite": "^8.0.8",
+    "vitest": "^4.1.4"
+  },
+  "peerDependencies": {
+    "electron": "^43.2.0"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

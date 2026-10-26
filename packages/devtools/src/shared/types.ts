@@ -1,0 +1,480 @@
+import type { CompileDiagnostic, OpenProjectOptions } from '@dimina-studio/devkit'
+import type { SimulatorApiHandler } from '../main/services/simulator/custom-apis.js'
+import type { MiniappSessionAppInfo } from '../main/runtime/miniapp-runtime.js'
+import type { ClosingProjectWindow, ProjectWindowConfig, ProjectWindowRef } from './project-window-types.js'
+import type { CompileConfig, CompileMode, CompileModes } from './compile-modes.js'
+import type { UpdateChecker } from './update-checker-types.js'
+
+export type { ClosingProjectWindow, ProjectWindowConfig, ProjectWindowRef }
+
+/**
+ * The compile-mode model lives next to its resolver in `compile-modes.ts` —
+ * the types and the rules that read them stay in one file. Re-exported here
+ * so the existing `shared/types.js` import sites keep working.
+ */
+export type { CompileConfig, CompileMode, CompileModes }
+
+/**
+ * The HAND-WRITTEN narrow contract handed to a host `menuBuilder` — the
+ * audited menu consumption surface only, same posture as `MiniappRuntime`.
+ * NOT an `Omit<WorkbenchContext, …>` projection: a projection drags every
+ * nested internal service type (adapter, windows → BrowserWindow, bridge,
+ * connections, …) onto the host-facing menu surface, making internal
+ * refactors unreviewed breaking changes for host menu builders.
+ *
+ * A full `WorkbenchContext` stays structurally assignable to this type, so
+ * hosts (and the default-menu path) that pass the whole ctx through keep
+ * compiling. Widening this surface is a deliberate semver decision.
+ */
+export interface MenuContext {
+  /** Branding name shown in title bar / menu labels. */
+  appName: string
+  /** Narrow workspace set a menu legitimately drives. */
+  workspace: {
+    hasActiveSession: () => boolean
+    getProjectPath: () => string
+    openProject: (projectPath: string) => Promise<{ success: boolean; error?: string }>
+    closeProject: () => Promise<void>
+    getSession: () => { appInfo: MiniappSessionAppInfo } | null
+  }
+  /** Open (or re-focus) the standalone workbench-settings window. */
+  openSettings: () => Promise<void>
+  notify: {
+    /** Broadcast compile-status transitions to the main renderer. */
+    projectStatus: (payload: { status: string; message: string; hotReload?: boolean }) => void
+    /** Bring the project-list window forward and refresh it (打开项目). */
+    windowNavigateBack: () => void
+  }
+  /** Re-check for an available application update when the host configured an update checker. */
+  checkForUpdates?: () => void
+}
+
+/**
+ * Structured `session.appInfo` DTO — the producer contract a
+ * `CompilationAdapter` must satisfy. Single definition: alias of the
+ * host-facing {@link MiniappSessionAppInfo} (`appId` required; the rest
+ * optional). `openProject` validates this shape at the adapter boundary and
+ * rejects sessions without a string `appId`.
+ */
+export type AppInfo = MiniappSessionAppInfo
+
+export interface ProjectSession {
+  close: () => Promise<void>
+  port: number
+  appInfo: AppInfo
+  diagnostics?: CompileDiagnostic[]
+  /**
+   * Run one real recompile of the session's project. Optional: a host
+   * CompilationAdapter predating this capability may omit it — the rebuild
+   * IPC then degrades to `{ supported: false }` and the renderer falls back
+   * to its reattach-only relaunch.
+   */
+  rebuild?: () => Promise<void>
+}
+
+export interface CompilationAdapter {
+  openProject(opts: Omit<OpenProjectOptions, 'containerDir' | 'outputDir' | 'outputRoot'>): Promise<ProjectSession>
+}
+
+export type BuiltinPanelId = 'wxml' | 'console' | 'appdata' | 'storage'
+export type BuiltinModuleId = 'projects' | 'session' | 'simulator' | 'popover' | 'settings'
+
+/**
+ * Custom mini-program file types. Same shape as the dmcc compiler's
+ * `build()` `options.fileTypes`: brand extensions appended on top of the
+ * built-in `wx*`/`dd*` families. In devtools this drives both the editor's
+ * extension → Monaco-language mapping (template→wxml, style→css,
+ * viewScript→javascript) and compilation — it is forwarded to the dmcc
+ * compiler via `openProject({ fileTypes })`.
+ */
+export interface CustomFileTypes {
+  template?: string[]
+  style?: string[]
+  viewScript?: string[]
+}
+
+export interface WorkbenchConfig {
+  /** Window title, default 'Dimina DevTools' */
+  appName?: string
+  /** Custom file types (e.g. `.altml`/`.altss`/`.alts`) recognized by the editor. */
+  fileTypes?: CustomFileTypes
+  /** Compilation adapter */
+  adapter?: CompilationAdapter
+  /**
+   * @deprecated Ignored at runtime. The config never filters the built-in
+   * panels and never lands on the context; which panels are on screen is
+   * governed solely by the persisted dock tree. A persisted tree missing part
+   * of the built-in debug strip is healed back to the full set on restore
+   * (`healMissingDebugPanels` in dock-layout.ts); the strip only disappears as
+   * a whole via the toolbar region toggle. Kept only so existing hosts passing
+   * it keep compiling.
+   */
+  panels?: BuiltinPanelId[]
+  /** Absolute path to a custom preload script (overrides built-in simulator.js) */
+  preloadPath?: string
+  /** Custom API namespace names (e.g. ['custom']) passed to the simulator */
+  apiNamespaces?: string[]
+  /** Provider for branding info (overrides default appName) */
+  brandingProvider?: () => Promise<{ appName: string }> | { appName: string }
+  /**
+   * @deprecated Ignored. The devtools toolbar header is fixed at 40px
+   * (`HEADER_H` in `shared/constants`). Hosts that need their own toolbar
+   * should use the host toolbar WCV instead. Kept only so existing hosts
+   * passing it keep compiling; it has no runtime effect.
+   */
+  headerHeight?: number
+}
+
+/**
+ * A project's runtime kind, detected from its source layout (see
+ * `detectRuntimeType` in main's `project-repository.ts`). Lives here because
+ * the value crosses the process boundary — main detects it and pushes it to
+ * the renderer over `ViewChannel.HostSidebarCategorySelected`, and the
+ * renderer's `Project.type` carries it back in the project list. Two
+ * structurally identical unions declared on either side would type-check
+ * against each other today and silently diverge the moment one gains a member.
+ */
+export type ProjectType = 'miniprogram' | 'minigame'
+
+export interface IpcResult<T = unknown> {
+  success: boolean
+  data?: T
+  error?: string
+}
+
+export interface WorkbenchWindowConfig {
+  width?: number
+  height?: number
+  minWidth?: number
+  minHeight?: number
+  /**
+   * Auto-show the main window on `ready-to-show`. Defaults to `true`. Set
+   * `false` when the host gates the window behind its own startup flow (e.g. a
+   * login screen) and wants to reveal it itself once ready — avoids an
+   * un-authed window flashing on screen.
+   *
+   * Visibility is governed by this flag in BOTH the test and non-test
+   * environments; the environment only chooses HOW to show (non-test →
+   * `show()`, test → `showInactive()` so e2e windows don't steal focus). When
+   * `false`, the framework calls neither in either env — the host owns reveal,
+   * test included.
+   */
+  autoShow?: boolean
+}
+
+export { isSameUpdateInfo, type UpdateChecker, type UpdateDownloadState, type UpdateInfo } from './update-checker-types.js'
+
+/**
+ * The instance passed to host hooks (menuBuilder, onSetup, onBeforeClose).
+ * `context` is a WorkbenchContext — import it from '@dimina-studio/devtools/context' for full typing.
+ */
+export interface WorkbenchHostInstance {
+  mainWindow: import('electron').BrowserWindow
+  // eslint-disable-next-line no-restricted-syntax -- grandfathered(workbench-context): shrink-only
+  context: import('../main/services/workbench-context.js').WorkbenchContext
+
+  /**
+   * Gated custom-IPC registration surface. Channels registered through this
+   * `IpcRegistry` are bound to `context.senderPolicy` and torn down with the
+   * context. This is the only supported path for host custom IPC.
+   */
+  readonly ipc: import('../main/utils/ipc-registry.js').IpcRegistry
+
+  /**
+   * Adds a host-owned BrowserWindow's renderer to the trusted-sender set so
+   * its `instance.ipc` calls pass the gateway. The window is auto-evicted
+   * when it closes; the returned Disposable evicts it explicitly and is also
+   * registered into `context.registry` for context-scoped cleanup.
+   */
+  registerTrustedWindow(
+    win: import('electron').BrowserWindow,
+  ): import('electron-deck/main').Disposable
+
+  /**
+   * Registers a simulator custom API, callable from mini-program code as
+   * `wx.<name>(params)`. The registry is app-level: one registration serves
+   * every project window, including windows opened afterwards, and no window
+   * closing revokes it. It lives until the app is disposed or the returned
+   * Disposable revokes it — which removes only the registration it created.
+   * The handler's optional second argument identifies the calling window's
+   * project; it is supplied by the main process, separately from miniapp params.
+   */
+  registerSimulatorApi(
+    name: string,
+    handler: SimulatorApiHandler,
+  ): import('electron-deck/main').Disposable
+
+  /**
+   * Installs a trusted host renderer bundle into this context's
+   * simulator UI runtime. Dimina owns the active DeviceShell mount point and
+   * reload/dispose lifecycle; the host owns the rendered DOM and business
+   * semantics.
+   */
+  registerSimulatorUiExtension(
+    registration: import('./simulator-ui.js').SimulatorUiExtensionRegistration,
+  ): import('./simulator-ui.js').SimulatorUiExtensionHandle
+}
+
+/**
+ * Pluggable backend for the project-list panel. Hosts may supply this to
+ * take over project storage from the default `<userData>/dimina-projects.json`.
+ *
+ * Detailed contract lives in
+ * `@dimina-studio/devtools/projects-provider` (the runtime exports it).
+ * Repeated here as a structural type so `WorkbenchAppConfig` can reference
+ * it without a circular import from the main-process tree.
+ */
+export interface ProjectsProvider {
+  listProjects(): unknown[] | Promise<unknown[]>
+  validateProjectDir?(dirPath: string): string | null
+  addProject(dirPath: string): unknown
+  removeProject(dirPath: string): void | Promise<void>
+  updateProject?(dirPath: string, patch: unknown): unknown
+  updateLastOpened?(dirPath: string): void | Promise<void>
+  getCompileConfig?(dirPath: string): unknown
+  saveCompileConfig?(dirPath: string, cfg: unknown): void | Promise<void>
+  getCompileModes?(dirPath: string): CompileModes | Promise<CompileModes>
+  saveCompileModes?(dirPath: string, modes: CompileModes): void | Promise<void>
+}
+
+/**
+ * A template the user can pick from in the "新建项目" dialog. Exactly one of
+ * `source` or `generate` should be supplied; if both are omitted, the
+ * service refuses to materialise the template.
+ */
+export interface ProjectTemplate {
+  /** Stable identifier. Used by host whitelists and the `templateId` field of CreateProjectInput. */
+  id: string
+  /** Human-readable label shown in the dialog. */
+  name: string
+  description?: string
+  icon?: string
+  /** Copy-tree source. `path` must be absolute. */
+  source?: { type: 'directory'; path: string }
+  /** Programmatic generator. `target` is the absolute destination directory. */
+  generate?: (target: string, opts: { name: string }) => Promise<void>
+}
+
+/**
+ * Payload returned from the create-project dialog. The service uses this to
+ * scaffold disk content and to register the project with the provider.
+ */
+export interface CreateProjectInput {
+  name: string
+  path: string
+  templateId?: string
+  extra?: Record<string, unknown>
+}
+
+/**
+ * Configuration for the embedded VS Code workbench editor — the sole devtools
+ * editor. This config only fine-tunes where the workbench bundle and host
+ * contributed extensions are served from; the editor is always on.
+ */
+export interface EditorViewConfig {
+  /**
+   * Absolute path to the built workbench bundle dir. Defaults to the
+   * devtools-bundled `dist/vscode-workbench`. Override to ship a custom workbench.
+   */
+  bundleDir?: string
+  /**
+   * host editor extensibility: absolute path to a directory of VS Code
+   * **web** extensions (each a folder with a `package.json` whose `browser`/
+   * `main` entry runs in the worker ext-host). The framework serves them through
+   * the workbench's same-origin COI server and the workbench registers each at
+   * boot, so a host (or host application) can contribute languages, commands, and views to
+   * the editor without forking the bundle. Omit for none.
+   */
+  extensionsDir?: string
+}
+
+export interface WorkbenchAppConfig extends WorkbenchConfig {
+  /** Absolute path to the renderer dist directory. Defaults to dimina-devtools' built-in renderer. */
+  rendererDir?: string
+  /** Enable or disable built-in IPC module groups. Defaults to all enabled. */
+  modules?: Partial<Record<BuiltinModuleId, boolean>>
+  /** Window sizing overrides for the project-list window. */
+  window?: WorkbenchWindowConfig
+  /** Overrides for the windows opened projects get. */
+  projectWindow?: ProjectWindowConfig
+  /** Absolute path to a window/taskbar icon (png or ico). macOS uses the app bundle icon. */
+  icon?: string
+  /** Custom menu builder. Should call Menu.setApplicationMenu(). If omitted, the default dimina-devtools menu is installed. */
+  menuBuilder?: (mainWindow: import('electron').BrowserWindow, menuContext: MenuContext) => void
+  /** Called after window and context are created but before start() resolves. Use to register custom IPC handlers. */
+  onSetup?: (instance: WorkbenchHostInstance) => void | Promise<void>
+  /**
+   * Called once per project window, after the framework has wired that window
+   * up and before the open resolves. `opened.context` is THAT window's own
+   * context, which is why per-project registration belongs here: `onSetup`
+   * only ever sees `instance.context`, the project list's, so a registration
+   * made there reaches no project window.
+   *
+   * Awaited, and unlike `onBeforeClose` it can fail the open: a rejection
+   * tears the half-built window down and reaches whoever asked for it.
+   */
+  setupProjectWindow?: (
+    instance: WorkbenchHostInstance,
+    opened: ProjectWindowRef,
+  ) => void | Promise<void>
+  /**
+   * Called when a project window is closing, before the framework disposes it.
+   * `closing` says WHICH project is going away and carries that window's own
+   * context — `instance.context` is always the project list's, which owns no
+   * session, so with several windows open it cannot tell them apart. A hook
+   * that only declares `instance` still type-checks.
+   *
+   * Awaited, but not a veto: a rejection is logged and the window is disposed
+   * regardless.
+   */
+  onBeforeClose?: (
+    instance: WorkbenchHostInstance,
+    closing: ClosingProjectWindow,
+  ) => void | Promise<void>
+  /**
+   * Called before a project is opened, BEFORE any side effect (session
+   * teardown, compile, dev-server). Use to gate the open on login/permission
+   * state. THROW to veto: `openProject` then resolves `{ success: false,
+   * error }`, leaves any currently-active session untouched, and never spins
+   * up the adapter. Resolve normally (or omit) to allow the open. The
+   * declarative alternative to monkey-patching `workspace.openProject`.
+   *
+   * On veto the framework surfaces the thrown error to the status bar
+   * (`notify.projectStatus({ status: 'error', message })`), symmetric with its
+   * own validateProjectDir rejection — the host need not reach for `notify`
+   * just to report the denial; it may layer richer UX (e.g. a dialog) on top.
+   */
+  onBeforeOpenProject?: (projectPath: string) => void | Promise<void>
+  /**
+   * Fine-tune the embedded VS Code workbench editor (the sole devtools
+   * editor). The 'editor' dock slot is always a main-process WebContentsView
+   * hosting the workbench (full project-wide IntelliSense, wxml LSP, dd/wx
+   * types); the framework starts the COI http server and bakes the
+   * SharedArrayBuffer switch unconditionally. Provide this only to override the
+   * bundle dir or contribute host extensions; omit for the defaults.
+   */
+  editorViewConfig?: EditorViewConfig
+  /** Custom update checker. If provided, enables the check-for-updates feature. */
+  updateChecker?: UpdateChecker
+  /** Extra options applied when an updateChecker is provided. */
+  updateOptions?: {
+    /** Check interval in milliseconds. Default: 1 hour */
+    checkInterval?: number
+    /** Delay before the first check after startup in ms. Default: 5000 */
+    initialDelay?: number
+    /** Override the version string passed to the checker. Default: app.getVersion() */
+    getCurrentVersion?: () => string
+  }
+
+  // ── Projects panel extension surface ──────────────────────────────────
+  //
+  // Three orthogonal extension points consumed by the create-project flow.
+  // All three can be omitted for the single-tenant default behavior.
+
+  /** Override the default `<userData>/dimina-projects.json` backend. */
+  projectsProvider?: ProjectsProvider
+  /** Templates injected at the head of the list; same-id overrides a built-in. */
+  projectTemplates?: ProjectTemplate[]
+  /** Built-in policy: 'all' (default), 'none', or an allowlist of ids. */
+  builtinTemplates?: 'all' | 'none' | string[]
+  /**
+   * Host-supplied "新建项目" dialog. When provided, the renderer routes the
+   * "+" card click through IPC into this main-process hook instead of
+   * showing the built-in dialog. Receives the parent window for native
+   * dialog parenting and the merged + sanitized template list (no
+   * `generate` functions cross the IPC boundary).
+   *
+   * Return either:
+   *  - `null` — user cancelled.
+   *  - a `CreateProjectInput` — devtools runs its built-in scaffold
+   *    (copy template → write project.config.json → provider.addProject)
+   *    on the host's behalf.
+   *  - `{ ready: Project }` — the host has ALREADY created the project
+   *    (typically via its own backend). devtools skips the scaffold and
+   *    just refreshes the list. Use this when materialization is remote
+   *    or already done.
+   */
+  customCreateProjectDialog?: (ctx: {
+    parentWindow: import('electron').BrowserWindow
+    templates: ProjectTemplate[]
+  }) => Promise<CustomCreateProjectDialogResult>
+  /**
+   * Host-supplied "编辑项目" dialog. When provided, the renderer routes the
+   * project card's edit action through IPC into this main-process hook
+   * instead of showing the built-in dialog. `project` is read from the
+   * current project-list record (not whatever the renderer happened to have
+   * in state), so the host always sees devtools' own authoritative record.
+   *
+   * Return either:
+   *  - `null` — user cancelled; devtools does nothing.
+   *  - `{ name?, iconUrl? }` — the host collected an edit; devtools applies
+   *    it via `workspace.updateProject`, the same path the built-in dialog's
+   *    submit uses.
+   *  - `{ updated: EditableProject }` — the host has ALREADY persisted the
+   *    change itself; devtools just refreshes the list.
+   *
+   * Unlike `customCreateProjectDialog`, "no hook configured" and "user
+   * cancelled" are NOT both collapsed to `null` on the wire: the create flow
+   * does that and it means a cancelled host dialog falls through into the
+   * built-in one right after. The `projects:openEditDialog` IPC instead
+   * returns `null` only when no hook is configured, and wraps the hook's
+   * result as `{ result }` otherwise — see `OpenEditProjectDialogReply`.
+   */
+  customEditProjectDialog?: (ctx: {
+    parentWindow: import('electron').BrowserWindow
+    project: EditableProject
+  }) => Promise<CustomEditProjectDialogResult>
+}
+
+/**
+ * Discriminated return of `customCreateProjectDialog`. `null` = cancelled.
+ * `{ ready }` = host created the project itself; devtools just refreshes.
+ * Otherwise treated as `CreateProjectInput` and devtools materializes the
+ * template locally.
+ *
+ * The `ready.Project` shape is the structural minimum devtools needs to
+ * render the card (mirrors `Project` in `./projects-provider`).
+ */
+export type CustomCreateProjectDialogResult =
+  | null
+  | {
+      ready: {
+        name: string
+        path: string
+        lastOpened?: string | null
+      }
+    }
+  | CreateProjectInput
+
+/**
+ * Structural minimum devtools needs to render a project-list card, passed to
+ * `customEditProjectDialog` and returned as its `updated` variant. Mirrors
+ * `Project` in `./projects-provider`.
+ */
+export interface EditableProject {
+  name: string
+  path: string
+  iconUrl?: string
+  lastOpened?: string | null
+}
+
+/**
+ * Discriminated return of `customEditProjectDialog`. `null` = cancelled.
+ * `{ updated }` = the host already persisted the edit; devtools just
+ * refreshes. Otherwise a `{ name?, iconUrl? }` patch devtools applies via
+ * `workspace.updateProject`.
+ */
+export type CustomEditProjectDialogResult =
+  | null
+  | { updated: EditableProject }
+  | { name?: string; iconUrl?: string }
+
+/**
+ * Wire reply for `projects:openEditDialog`. `null` means the host configured
+ * no `customEditProjectDialog` hook at all — the renderer should show the
+ * built-in dialog. When a hook IS configured, the IPC always resolves
+ * `{ result }` even if `result` is `null` (user cancelled the host dialog),
+ * so the renderer can tell "no hook" apart from "hook ran, user cancelled"
+ * and skip the built-in fallback in the latter case.
+ */
+export type OpenEditProjectDialogReply = null | { result: CustomEditProjectDialogResult }

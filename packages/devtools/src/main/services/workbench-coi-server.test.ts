@@ -1,0 +1,428 @@
+/**
+ * Security hardening of the workbench COI server's `/__fs` project bridge and
+ * `/__contrib` extension server. These tests run against the REAL filesystem
+ * (symlink containment cannot be exercised through mocks) and assert the
+ * sandbox invariants that keep an in-renderer workbench — or any localhost
+ * page — from reading or mutating files outside the active project root.
+ */
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import fs from 'node:fs/promises'
+import http from 'node:http'
+import os from 'node:os'
+import path from 'node:path'
+
+// The COI server pulls in `electron` transitively (project-fs → ipc-registry's
+// top-level `import { ipcMain } from 'electron'`). CI has no Electron binary, so
+// the unmocked import throws at module-eval. The server never touches ipcMain;
+// a no-op stub is enough to let the module load.
+vi.mock('electron', () => ({ ipcMain: { handle: vi.fn(), removeHandler: vi.fn(), on: vi.fn(), off: vi.fn() } }))
+
+import { startWorkbenchCoiServer, type WorkbenchCoiServer } from './workbench-coi-server.js'
+
+let tmpParent = ''
+let rootDir = ''
+let projectRoot = ''
+let outsideDir = ''
+let activeProjectRoot = ''
+let server: WorkbenchCoiServer | null = null
+
+function startWith(opts: {
+  getProjectRoot?: () => string
+  extensionsDir?: string
+}): Promise<WorkbenchCoiServer> {
+  return startWorkbenchCoiServer({
+    rootDir,
+    getProjectRoot: opts.getProjectRoot ?? (() => activeProjectRoot),
+    extensionsDir: opts.extensionsDir,
+  })
+}
+
+beforeEach(async () => {
+  // A single mkdtemp parent for both the project root and the "outside" secret
+  // dir, so both live under the same realpath'd ancestor; assertions check
+  // status + content leakage, never exact path strings (macos /tmp is itself a
+  // symlink, which the server realpath's away).
+  tmpParent = await fs.mkdtemp(path.join(os.tmpdir(), 'coi-test-'))
+  rootDir = path.join(tmpParent, 'bundle')
+  projectRoot = path.join(tmpParent, 'project')
+  outsideDir = path.join(tmpParent, 'outside')
+  await fs.mkdir(rootDir, { recursive: true })
+  await fs.mkdir(projectRoot, { recursive: true })
+  await fs.mkdir(outsideDir, { recursive: true })
+  // Static bundle needs an index.html so the server has something to serve.
+  await fs.writeFile(path.join(rootDir, 'index.html'), '<!doctype html>ok')
+  activeProjectRoot = projectRoot
+  server = null
+})
+
+afterEach(async () => {
+  if (server) {
+    await server.close()
+    server = null
+  }
+  await fs.rm(tmpParent, { recursive: true, force: true })
+})
+
+describe('symlink containment on /__fs', () => {
+  it('refuses to read a file through a symlink that points outside the root', async () => {
+    const secret = path.join(outsideDir, 'secret.txt')
+    await fs.writeFile(secret, 'SECRET')
+    await fs.symlink(secret, path.join(projectRoot, 'link'))
+
+    server = await startWith({})
+    const res = await fetch(`${server.baseUrl}__fs/read?p=link`)
+
+    expect(res.status).toBeGreaterThanOrEqual(400)
+    expect(res.status).toBeLessThan(500)
+    expect(res.status).toBe(403)
+    const body = await res.text()
+    expect(body).not.toContain('SECRET')
+  })
+
+  it('refuses to stat a file through an out-of-root symlink', async () => {
+    const secret = path.join(outsideDir, 'secret.txt')
+    await fs.writeFile(secret, 'SECRET')
+    await fs.symlink(secret, path.join(projectRoot, 'link'))
+
+    server = await startWith({})
+    const res = await fetch(`${server.baseUrl}__fs/stat?p=link`)
+
+    expect(res.status).toBeGreaterThanOrEqual(400)
+    expect(res.status).toBeLessThan(500)
+    const body = await res.text()
+    expect(body).not.toContain('"size"')
+  })
+
+  it('refuses to write through a symlinked-out parent directory', async () => {
+    await fs.symlink(outsideDir, path.join(projectRoot, 'escdir'))
+
+    server = await startWith({})
+    const res = await fetch(`${server.baseUrl}__fs/write?p=escdir/x.txt`, {
+      method: 'POST',
+      body: Buffer.from('payload'),
+    })
+
+    expect(res.status).toBeGreaterThanOrEqual(400)
+    expect(res.status).toBeLessThan(500)
+    // The write must not have leaked a file into the outside dir.
+    await expect(fs.stat(path.join(outsideDir, 'x.txt'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+  })
+
+  it('reads and writes a normal in-root file (positive control)', async () => {
+    server = await startWith({})
+
+    const writeRes = await fetch(`${server.baseUrl}__fs/write?p=note.txt`, {
+      method: 'POST',
+      body: Buffer.from('hello world'),
+    })
+    expect(writeRes.status).toBe(204)
+
+    const readRes = await fetch(`${server.baseUrl}__fs/read?p=note.txt`)
+    expect(readRes.status).toBe(200)
+    expect(await readRes.text()).toBe('hello world')
+
+    // The bytes actually landed on disk inside the root.
+    expect(await fs.readFile(path.join(projectRoot, 'note.txt'), 'utf8')).toBe('hello world')
+  })
+})
+
+describe('method + origin guard on mutating /__fs actions', () => {
+  it('rejects a mutating action issued over GET with 405 and changes nothing', async () => {
+    await fs.writeFile(path.join(projectRoot, 'foo.txt'), 'keep')
+
+    server = await startWith({})
+    const res = await fetch(`${server.baseUrl}__fs/write?p=foo.txt`)
+
+    expect(res.status).toBe(405)
+    expect(await fs.readFile(path.join(projectRoot, 'foo.txt'), 'utf8')).toBe('keep')
+  })
+
+  it('rejects delete over GET with 405 and leaves the file in place', async () => {
+    await fs.writeFile(path.join(projectRoot, 'foo.txt'), 'keep')
+
+    server = await startWith({})
+    const res = await fetch(`${server.baseUrl}__fs/delete?p=foo.txt`)
+
+    expect(res.status).toBe(405)
+    await expect(fs.stat(path.join(projectRoot, 'foo.txt'))).resolves.toBeTruthy()
+  })
+
+  it('rejects a POST delete from a cross-origin Origin with 403 and keeps the file', async () => {
+    await fs.writeFile(path.join(projectRoot, 'foo.txt'), 'keep')
+
+    server = await startWith({})
+    const res = await fetch(`${server.baseUrl}__fs/delete?p=foo.txt`, {
+      method: 'POST',
+      headers: { Origin: 'http://evil.example' },
+    })
+
+    expect(res.status).toBe(403)
+    await expect(fs.stat(path.join(projectRoot, 'foo.txt'))).resolves.toBeTruthy()
+  })
+
+  it('allows an origin-less POST delete (the workbench own fetch)', async () => {
+    await fs.writeFile(path.join(projectRoot, 'foo.txt'), 'keep')
+
+    server = await startWith({})
+    const res = await fetch(`${server.baseUrl}__fs/delete?p=foo.txt`, {
+      method: 'POST',
+    })
+
+    expect(res.status).toBe(204)
+    await expect(fs.stat(path.join(projectRoot, 'foo.txt'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+  })
+
+  it('rejects a POST write tagged Sec-Fetch-Site: cross-site with 403', async () => {
+    server = await startWith({})
+    const res = await fetch(`${server.baseUrl}__fs/write?p=cross.txt`, {
+      method: 'POST',
+      headers: { 'Sec-Fetch-Site': 'cross-site' },
+      body: Buffer.from('nope'),
+    })
+
+    expect(res.status).toBe(403)
+    await expect(fs.stat(path.join(projectRoot, 'cross.txt'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+  })
+})
+
+describe('request body size limit on /__fs/write', () => {
+  it('rejects a body larger than 32MB with 413 and writes nothing', async () => {
+    server = await startWith({})
+    // Slightly over the 32 MiB cap.
+    const oversized = Buffer.alloc(32 * 1024 * 1024 + 64, 0x61)
+
+    const res = await fetch(`${server.baseUrl}__fs/write?p=big.bin`, {
+      method: 'POST',
+      body: oversized,
+    })
+
+    expect(res.status).toBe(413)
+    await expect(fs.stat(path.join(projectRoot, 'big.bin'))).rejects.toMatchObject({
+      code: 'ENOENT',
+    })
+  })
+})
+
+describe('/__fs/readdir dependency-dir filtering', () => {
+  it('omits SKIP_DIRS directories at every level so the mirror/ledger walk never descends into them', async () => {
+    server = await startWith({})
+    await fs.mkdir(path.join(projectRoot, 'node_modules', 'pkg'), { recursive: true })
+    await fs.writeFile(path.join(projectRoot, 'node_modules', 'pkg', 'index.js'), 'dep')
+    await fs.mkdir(path.join(projectRoot, 'packages', 'x', 'node_modules'), { recursive: true })
+    await fs.writeFile(path.join(projectRoot, 'packages', 'x', 'main.js'), 'src')
+    await fs.writeFile(path.join(projectRoot, 'app.js'), 'src')
+
+    const top = (await (await fetch(`${server.baseUrl}__fs/readdir?p=.`)).json()) as Array<[string, number]>
+    const topNames = top.map(([name]) => name)
+    expect(topNames).toContain('app.js')
+    expect(topNames).toContain('packages')
+    expect(topNames).not.toContain('node_modules')
+
+    const nested = (await (
+      await fetch(`${server.baseUrl}__fs/readdir?p=${encodeURIComponent('packages/x')}`)
+    ).json()) as Array<[string, number]>
+    const nestedNames = nested.map(([name]) => name)
+    expect(nestedNames).toContain('main.js')
+    expect(nestedNames).not.toContain('node_modules')
+  })
+
+  it('keeps a plain FILE named like a skip dir visible (only directories are filtered)', async () => {
+    server = await startWith({})
+    await fs.writeFile(path.join(projectRoot, 'dist'), 'a file, not a build dir')
+    const top = (await (await fetch(`${server.baseUrl}__fs/readdir?p=.`)).json()) as Array<
+      [string, number, number?, number?]
+    >
+    const dist = top.find(([name]) => name === 'dist')
+    // File entries carry `size`/`mtimeMs`; a directory entry stays the plain
+    // `[name, 2]` shape.
+    expect(dist).toEqual(['dist', 1, 'a file, not a build dir'.length, expect.any(Number)])
+  })
+
+  it('answers 404 to /__fs/read of a DIRECTORY path (EISDIR — as a file it does not exist)', async () => {
+    server = await startWith({})
+    await fs.mkdir(path.join(projectRoot, 'was-a-file'), { recursive: true })
+    await fs.writeFile(path.join(projectRoot, 'was-a-file', 'inner.js'), 'x')
+    const res = await fetch(`${server.baseUrl}__fs/read?p=was-a-file`)
+    expect(res.status).toBe(404)
+  })
+})
+
+describe('no active project', () => {
+  it('responds 409 to readdir so the provider stays empty rather than erroring', async () => {
+    server = await startWith({ getProjectRoot: () => '' })
+    const res = await fetch(`${server.baseUrl}__fs/readdir?p=.`)
+    expect(res.status).toBe(409)
+  })
+})
+
+describe('/__filetypes endpoint', () => {
+  it('returns 200 application/json with the object returned by getFileTypes', async () => {
+    server = await startWorkbenchCoiServer({
+      rootDir,
+      getProjectRoot: () => activeProjectRoot,
+      getFileTypes: () => ({ template: ['altml'], style: ['altss'], viewScript: ['alts'] }),
+    })
+    const res = await fetch(`${server.baseUrl}__filetypes`)
+    expect(res.status).toBe(200)
+    expect(res.headers.get('content-type')).toMatch(/application\/json/)
+    const body = await res.json()
+    expect(body).toEqual({ template: ['altml'], style: ['altss'], viewScript: ['alts'] })
+  })
+
+  it('returns 200 with body {} when getFileTypes is omitted', async () => {
+    server = await startWorkbenchCoiServer({
+      rootDir,
+      getProjectRoot: () => activeProjectRoot,
+    })
+    const res = await fetch(`${server.baseUrl}__filetypes`)
+    expect(res.status).toBe(200)
+    const body = await res.json()
+    expect(body).toEqual({})
+  })
+
+  it('reads getFileTypes per-request so a changed value is reflected on the next request', async () => {
+    let current: unknown = { template: ['altml'] }
+    server = await startWorkbenchCoiServer({
+      rootDir,
+      getProjectRoot: () => activeProjectRoot,
+      getFileTypes: () => current,
+    })
+
+    const first = await fetch(`${server.baseUrl}__filetypes`)
+    expect(await first.json()).toEqual({ template: ['altml'] })
+
+    current = { style: ['altss'] }
+    const second = await fetch(`${server.baseUrl}__filetypes`)
+    expect(await second.json()).toEqual({ style: ['altss'] })
+  })
+})
+
+describe('symlink containment on /__contrib', () => {
+  it('serves a valid extension file but refuses an out-of-root symlink', async () => {
+    const extDir = path.join(tmpParent, 'extensions')
+    const ext = path.join(extDir, 'ext')
+    await fs.mkdir(ext, { recursive: true })
+    await fs.writeFile(
+      path.join(ext, 'package.json'),
+      JSON.stringify({ name: 'ext', version: '0.0.1' }),
+    )
+    const secret = path.join(outsideDir, 'contrib-secret.txt')
+    await fs.writeFile(secret, 'SECRET')
+    await fs.symlink(secret, path.join(ext, 'leak.txt'))
+
+    server = await startWith({ extensionsDir: extDir })
+
+    const leakRes = await fetch(`${server.baseUrl}__contrib/ext/leak.txt`)
+    expect(leakRes.status).not.toBe(200)
+    expect([403, 404]).toContain(leakRes.status)
+    expect(await leakRes.text()).not.toContain('SECRET')
+
+    const pkgRes = await fetch(`${server.baseUrl}__contrib/ext/package.json`)
+    expect(pkgRes.status).toBe(200)
+    expect(await pkgRes.text()).toContain('"name":"ext"')
+  })
+})
+
+describe('503 on new requests once the window has begun closing', () => {
+  it('serves normally before close() and refuses new requests with 503 once closing starts', async () => {
+    // getProjectRoot is read on every /__fs request, including the sanity GET
+    // below — so the "being served" signal has to single out the SECOND call
+    // (the write), or it fires early and close() races ahead of the write
+    // ever being tracked as in flight.
+    let calls = 0
+    let serving: () => void = () => {}
+    const beingServed = new Promise<void>((resolve) => { serving = resolve })
+    server = await startWorkbenchCoiServer({
+      rootDir,
+      getProjectRoot: () => { calls += 1; if (calls === 2) serving(); return activeProjectRoot },
+    })
+
+    const before = await fetch(`${server.baseUrl}__fs/readdir?p=.`)
+    expect(before.status).toBe(200)
+
+    // Keep a write in flight (headers sent, body withheld) so `drain()` has
+    // something to wait on: with nothing in flight it resolves synchronously
+    // and releases the window's route before a next request could observe
+    // `closing`, undershooting the window this guards.
+    const saveUrl = new URL('__fs/write?p=held.txt', server.baseUrl)
+    const save = http.request({
+      host: '127.0.0.1',
+      port: server.port,
+      path: saveUrl.pathname + saveUrl.search,
+      method: 'POST',
+      headers: { 'Content-Length': '4' },
+    })
+    save.on('error', () => {})
+    save.write('ab')
+    await beingServed
+
+    try {
+      // shutdown.drain() flips `closing` synchronously before its first
+      // await (see workbench-coi-shutdown.ts), so this observes the flip
+      // deterministically rather than racing it.
+      const closingPromise = server.close()
+      const after = await fetch(`${server.baseUrl}__fs/readdir?p=.`)
+      expect(after.status).toBe(503)
+
+      save.end('cd')
+      await closingPromise
+    } finally {
+      save.destroy()
+    }
+    server = null
+  })
+})
+
+/**
+ * A window's bridge is a route on the shared COI host, and the window cannot
+ * finish closing until that route is drained and dropped, without taking a
+ * save that is still arriving down with it.
+ *
+ * These reach the bridge over a raw `http.request` (a `fetch` cannot leave a
+ * body half-sent), so they have to spell out the window path prefix that
+ * `baseUrl` carries.
+ */
+describe('shutting the server down with connections still open', () => {
+  it('lets a save that is still uploading reach disk', async () => {
+    let serving: () => void = () => {}
+    const beingServed = new Promise<void>((resolve) => { serving = resolve })
+    server = await startWorkbenchCoiServer({
+      rootDir,
+      getProjectRoot: () => { serving(); return activeProjectRoot },
+    })
+
+    const body = Buffer.from('the edit the user just made\n'.repeat(64))
+    const saveUrl = new URL('__fs/write?p=saved.txt', server.baseUrl)
+    const save = http.request({
+      host: '127.0.0.1',
+      port: server.port,
+      path: saveUrl.pathname + saveUrl.search,
+      method: 'POST',
+      headers: { 'Content-Length': String(body.length) },
+    })
+    save.on('error', () => {})
+    // Headers first, body second — that split is where an editor save is when
+    // the window closes underneath it.
+    save.write(body.subarray(0, 16))
+    await beingServed
+
+    try {
+      const closed = server.close()
+      save.end(body.subarray(16))
+      await closed
+
+      expect(
+        await fs.readFile(path.join(projectRoot, 'saved.txt'), 'utf8'),
+        'taking the sockets the moment shutdown starts would discard the file the user just saved',
+      ).toBe(body.toString())
+    } finally {
+      save.destroy()
+    }
+  }, 15_000)
+})

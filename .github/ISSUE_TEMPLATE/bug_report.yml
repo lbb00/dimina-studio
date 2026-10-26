@@ -1,0 +1,50 @@
+name: 缺陷
+description: 某个功能的实际结果和预期不一致
+title: "fix: "
+labels:
+  - bug
+body:
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 实际发生了什么
+      description: 写下你看到的结果，以及你期望看到的结果。
+      placeholder: 保存样式后，模拟器整页重新加载，页面上的输入被清掉了。我期望只更新样式。
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: 怎样复现
+      description: 按顺序写下操作。能稳定复现时请注明。
+      placeholder: |
+        1. 用 Dimina DevTools 0.4.0 打开示例项目
+        2. 修改 pages/index/index.wxss 并保存
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 版本
+      description: 桌面应用版本，或 npm 包名和版本。
+      placeholder: Dimina DevTools 0.4.0，或 @dimina-studio/devkit 0.4.0
+    validations:
+      required: true
+  - type: dropdown
+    id: os
+    attributes:
+      label: 系统
+      options:
+        - macOS
+        - Windows
+        - Linux
+        - 只使用了 npm 包，与桌面系统无关
+    validations:
+      required: true
+  - type: textarea
+    id: extra
+    attributes:
+      label: 其他信息
+      description: 日志、截图或相关配置。不要贴入密钥。
+    validations:
+      required: false

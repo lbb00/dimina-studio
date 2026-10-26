@@ -1,0 +1,277 @@
+import { test as base, expect, _electron, type ElectronApplication, type Page } from '@playwright/test'
+import fs from 'fs'
+import path from 'path'
+import { fileURLToPath } from 'url'
+import { ProjectsChannel } from '../src/shared/ipc-channels'
+import { ipcInvoke, openProjectInUI, closeProject, resetSimulatorState, findMainWindow, findWorkbenchWindow } from './helpers'
+import { armMaxListenersGuard, type MaxListenersGuard } from './resource-guards'
+
+const __dirname = path.dirname(fileURLToPath(import.meta.url))
+
+/**
+ * Custom Playwright fixtures for the Dimina DevTools Electron app.
+ *
+ * Architecture:
+ * - `electronApp` is **worker-scoped**: one Electron process per Playwright worker,
+ *   reused across all tests that run in that worker. Each worker uses its own
+ *   `--user-data-dir` so workers don't fight over Electron singleton locks,
+ *   project lists, or settings files.
+ * - `mainWindow` is **test-scoped** but does NOT relaunch Electron — it grabs the
+ *   existing first window from the worker-scoped app and runs a quick health
+ *   check (window alive + IPC ping). On failure it triggers a relaunch.
+ *
+ * Spec authors who want to share a single opened project across all tests in
+ * one spec file should use {@link useSharedProject} (see its JSDoc for usage).
+ */
+
+export interface ElectronFixtures {
+  electronApp: ElectronApplication
+  mainWindow: Page
+  /**
+   * The window an open project lives in. Resolved lazily — only a spec that
+   * destructures it waits for one — so it pairs with `useSharedProject`,
+   * which opens the project in `beforeAll` and is what identifies the window:
+   * a project window an earlier spec left open is also a workbench window, so
+   * listing order alone would hand this spec the wrong project. A spec that
+   * opens its own project should use `openProjectInUI`'s return value.
+   */
+  workbench: Page
+  /**
+   * Auto fixture (leak gate): fails any test during which the Electron app's
+   * stderr printed a MaxListenersExceededWarning — a leaked-listener class that
+   * memory metrics can't see. Depend on it implicitly; never reference it.
+   */
+  _maxListenersGate: void
+}
+
+export interface ElectronWorkerFixtures {
+  // _workerElectron is internal — tests should depend on `electronApp` (test-scoped wrapper).
+  _workerElectron: WorkerElectronHandle
+}
+
+interface WorkerElectronHandle {
+  app: ElectronApplication
+  /** Force-relaunch the Electron process, replacing the held instance. */
+  relaunch: () => Promise<void>
+  userDataDir: string
+  /** stderr MaxListenersExceededWarning collector for the CURRENT app instance. */
+  guard: MaxListenersGuard
+}
+
+// playwright.config.ts sets DIMINA_DEVTOOLS_DATA_DIR at runner level but
+// workers spawn from a fresh node process and lose top-level env mutations,
+// so re-seed it here too. setupDataPaths() in bootstrap.ts and
+// userDataDirFor() below both read process.env.DIMINA_DEVTOOLS_DATA_DIR;
+// a single source of truth keeps Chromium caches off the system partition
+// regardless of which entry point loaded first.
+if (!process.env.DIMINA_DEVTOOLS_DATA_DIR && fs.existsSync('/Volumes/jdisk')) {
+  process.env.DIMINA_DEVTOOLS_DATA_DIR = '/Volumes/jdisk/electron-data/dimina-devtools-e2e'
+}
+
+function userDataDirFor(workerIndex: number): string {
+  // Honour DIMINA_DEVTOOLS_DATA_DIR (default: external jdisk) so per-worker
+  // Electron userData (Chromium cache, IndexedDB, dictionaries — ~100MB each)
+  // doesn't bloat the constrained system partition.
+  const base = process.env.DIMINA_DEVTOOLS_DATA_DIR
+    ?? path.resolve(__dirname, '..', 'node_modules', '.cache', 'devtools-e2e')
+  const dir = path.join(base, 'userdata', `worker-${workerIndex}`)
+  fs.mkdirSync(dir, { recursive: true })
+  return dir
+}
+
+async function launchElectron(userDataDir: string): Promise<ElectronApplication> {
+  const appPath = path.resolve(__dirname, 'electron-entry.js')
+  const electronApp = await _electron.launch({
+    args: [appPath, `--user-data-dir=${userDataDir}`],
+    env: {
+      ...process.env,
+      NODE_ENV: 'test',
+      // Forwarded to the main process in case the app prefers an env var over the CLI switch.
+      DIMINA_E2E_USER_DATA_DIR: userDataDir,
+    },
+  })
+
+  const mainWindow = await findMainWindow(electronApp)
+  await mainWindow.waitForLoadState('domcontentloaded')
+
+  // Move off-screen + blur so the test windows don't steal focus.
+  await electronApp.evaluate(async ({ BrowserWindow }) => {
+    const win = BrowserWindow.getAllWindows()[0]
+    if (win && !win.isVisible()) {
+      await new Promise<void>((resolve) => {
+        win.once('show', resolve)
+        setTimeout(resolve, 5000)
+      })
+    }
+    if (win) {
+      win.setPosition(-2000, -2000)
+      win.blur()
+    }
+  })
+
+  return electronApp
+}
+
+async function isHealthy(app: ElectronApplication, win: Page | undefined): Promise<boolean> {
+  try {
+    if (!app) return false
+    if (app.windows().length === 0) return false
+    if (!win) return false
+    if (win.isClosed()) return false
+    // One quick IPC ping — projects:list is read-only and always registered.
+    await ipcInvoke(win, ProjectsChannel.List)
+    return true
+  } catch {
+    return false
+  }
+}
+
+/**
+ * The project {@link useSharedProject} opened for the running describe block,
+ * or `null` outside one. The `workbench` fixture resolves its window by this
+ * path rather than by listing order: several project windows can be open at
+ * once and an earlier spec may still own one, so "the first workbench window"
+ * is not necessarily this spec's.
+ */
+let sharedProjectDir: string | null = null
+
+export const test = base.extend<ElectronFixtures, ElectronWorkerFixtures>({
+  _workerElectron: [
+    // eslint-disable-next-line no-empty-pattern
+    async ({}, use, workerInfo) => {
+      const userDataDir = userDataDirFor(workerInfo.workerIndex)
+
+      let app = await launchElectron(userDataDir)
+      let guard = armMaxListenersGuard(app)
+
+      const handle: WorkerElectronHandle = {
+        get app() {
+          return app
+        },
+        relaunch: async () => {
+          await app.close().catch(() => {})
+          app = await launchElectron(userDataDir)
+          guard = armMaxListenersGuard(app)
+        },
+        userDataDir,
+        get guard() {
+          return guard
+        },
+      } as WorkerElectronHandle
+
+      await use(handle)
+
+      await app.close().catch(() => {})
+    },
+    { scope: 'worker' },
+  ],
+
+  electronApp: async ({ _workerElectron }, use) => {
+    // Expose the worker-scoped Electron app to tests as if it were test-scoped.
+    // The mainWindow fixture below is responsible for health-checking & relaunching.
+    await use(_workerElectron.app)
+  },
+
+  mainWindow: async ({ _workerElectron }, use) => {
+    let win = await findMainWindow(_workerElectron.app)
+    if (!(await isHealthy(_workerElectron.app, win))) {
+      await _workerElectron.relaunch()
+      win = await findMainWindow(_workerElectron.app)
+      await win.waitForLoadState('domcontentloaded')
+    }
+    await use(win)
+  },
+
+  workbench: async ({ _workerElectron }, use) => {
+    const win = await findWorkbenchWindow(
+      _workerElectron.app,
+      sharedProjectDir === null ? {} : { projectDir: sharedProjectDir },
+    )
+    await win.waitForLoadState('domcontentloaded')
+    await use(win)
+  },
+
+  _maxListenersGate: [
+    async ({ _workerElectron }, use) => {
+      const seenBefore = _workerElectron.guard.warnings().length
+      await use(undefined)
+      const during = _workerElectron.guard.warnings().slice(seenBefore)
+      expect(
+        during,
+        'the app emitted MaxListenersExceededWarning during this test — a listener leaked on a shared emitter',
+      ).toEqual([])
+    },
+    { auto: true },
+  ],
+})
+
+/**
+ * Share one opened project across every test in the calling spec file.
+ *
+ * Call this at the top of a `test.describe` block (or top-level of the file).
+ * It registers `beforeAll`/`afterAll`/`afterEach` hooks against the passed
+ * `test` object. Inside each test, use the `workbench` fixture for anything
+ * about the open project (simulator, panels, editor, toolbar) and `mainWindow`
+ * only for the project list itself — they are two different windows now.
+ *
+ * Between tests it clears `wx` storage and navigates the simulator back to
+ * the configured home page. This is best-effort: a test that leaves the
+ * simulator in an unreachable state (e.g. crashed webview) will still
+ * benefit from the worker-scoped Electron health check on the next
+ * `mainWindow` acquisition.
+ *
+ * Usage:
+ *
+ * ```ts
+ * import { test, expect, useSharedProject } from './fixtures'
+ * import { DEMO_APP_DIR } from './helpers'
+ *
+ * test.describe('My feature', () => {
+ *   useSharedProject(test, DEMO_APP_DIR)
+ *
+ *   test('does a thing', async ({ workbench, electronApp }) => {
+ *     // project is already open in `workbench`; just exercise it.
+ *   })
+ * })
+ * ```
+ *
+ * Options:
+ * - `openOptions`  — forwarded to `openProjectInUI`. Default `{}`.
+ */
+export interface UseSharedProjectOptions {
+  openOptions?: Parameters<typeof openProjectInUI>[2]
+  /**
+   * Timeout for the one-time `beforeAll` project open. Playwright's beforeAll
+   * runs under the CONFIG default hook timeout (60s) — `test.setTimeout` at
+   * describe level does not reach it — and a first open that triggers a full
+   * demo-app compile can exceed that. Omitted → Playwright's default stands.
+   */
+  openTimeoutMs?: number
+}
+
+export function useSharedProject(
+  testObj: typeof test,
+  projectDir: string,
+  options: UseSharedProjectOptions = {},
+): void {
+  const { openOptions, openTimeoutMs } = options
+
+  // beforeAll/afterAll only receive worker-scoped fixtures, so we rely on
+  // _workerElectron and resolve windows ourselves.
+  testObj.beforeAll(async ({ _workerElectron }) => {
+    if (openTimeoutMs !== undefined) testObj.setTimeout(openTimeoutMs)
+    sharedProjectDir = projectDir
+    await openProjectInUI(_workerElectron.app, projectDir, openOptions)
+  })
+
+  testObj.afterEach(async ({ electronApp }) => {
+    await resetSimulatorState(electronApp)
+  })
+
+  testObj.afterAll(async ({ _workerElectron }) => {
+    sharedProjectDir = null
+    await closeProject(_workerElectron.app, { projectDir }).catch(() => {})
+  })
+}
+
+export { expect } from '@playwright/test'

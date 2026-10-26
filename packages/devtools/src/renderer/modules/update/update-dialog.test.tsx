@@ -1,0 +1,199 @@
+/**
+ * Regression: install() resolves `{success:false, error}` on a failed
+ * shell.openPath() (not a rejection — see update-manager.ts). Before this
+ * fix, handleInstall only had a `.catch()` and never inspected the resolved
+ * value, so a failed install left the dialog stuck showing "Ready to
+ * Install" forever with no feedback and no way to retry.
+ */
+import { render, screen, fireEvent, waitFor, act } from '@testing-library/react'
+import { beforeEach, describe, expect, it, vi } from 'vitest'
+
+const { invokeStrictMock, onMock, sendMock, listeners } = vi.hoisted(() => {
+  const listeners = new Map<string, (...args: unknown[]) => void>()
+  return {
+    invokeStrictMock: vi.fn(),
+    onMock: vi.fn((channel: string, cb: (...args: unknown[]) => void) => {
+      listeners.set(channel, cb)
+      return () => listeners.delete(channel)
+    }),
+    sendMock: vi.fn(),
+    listeners,
+  }
+})
+
+vi.mock('@/shared/api/ipc-transport', () => ({
+  invokeStrict: invokeStrictMock,
+  on: onMock,
+  send: sendMock,
+}))
+
+import { UpdateChannel, OverlayChannel } from '../../../shared/ipc-channels-overlays.js'
+import { UpdateDialog } from './update-dialog'
+
+const UPDATE_INFO = { version: '2.0.0', downloadUrl: 'https://example.com/2.0.0.dmg' }
+
+beforeEach(() => {
+  invokeStrictMock.mockReset()
+  sendMock.mockReset()
+  listeners.clear()
+})
+
+async function openAndDownload() {
+  render(<UpdateDialog />)
+  act(() => { listeners.get(UpdateChannel.Available)!(UPDATE_INFO) })
+  invokeStrictMock.mockResolvedValueOnce({ success: true })
+  fireEvent.click(await screen.findByRole('button', { name: 'Download' }))
+  await screen.findByRole('button', { name: 'Install & Restart' })
+}
+
+describe('UpdateDialog: install failure feedback', () => {
+  it('shows the install error (not "Download failed") when install() resolves success:false', async () => {
+    await openAndDownload()
+    invokeStrictMock.mockResolvedValueOnce({ success: false, error: 'no application associated with this file' })
+
+    fireEvent.click(screen.getByRole('button', { name: 'Install & Restart' }))
+
+    await waitFor(() => {
+      expect(screen.getByText('Install failed: no application associated with this file')).toBeInTheDocument()
+    })
+    expect(screen.getByRole('button', { name: 'Retry' })).toBeInTheDocument()
+  })
+
+  it('Retry after an install failure retries install(), not a fresh download()', async () => {
+    await openAndDownload()
+    invokeStrictMock.mockResolvedValueOnce({ success: false, error: 'boom' })
+    fireEvent.click(screen.getByRole('button', { name: 'Install & Restart' }))
+    await screen.findByRole('button', { name: 'Retry' })
+
+    invokeStrictMock.mockClear()
+    invokeStrictMock.mockResolvedValueOnce({ success: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+
+    await waitFor(() => {
+      expect(invokeStrictMock).toHaveBeenCalledWith(UpdateChannel.Install)
+    })
+    expect(invokeStrictMock).not.toHaveBeenCalledWith(UpdateChannel.Download)
+  })
+
+  it('a download failure still labels itself "Download failed" and Retry re-downloads', async () => {
+    render(<UpdateDialog />)
+    act(() => { listeners.get(UpdateChannel.Available)!(UPDATE_INFO) })
+    invokeStrictMock.mockResolvedValueOnce({ success: false, error: 'network error' })
+
+    fireEvent.click(await screen.findByRole('button', { name: 'Download' }))
+
+    await waitFor(() => {
+      expect(screen.getByText('Download failed: network error')).toBeInTheDocument()
+    })
+
+    invokeStrictMock.mockClear()
+    invokeStrictMock.mockResolvedValueOnce({ success: true })
+    fireEvent.click(screen.getByRole('button', { name: 'Retry' }))
+
+    await waitFor(() => {
+      expect(invokeStrictMock).toHaveBeenCalledWith(UpdateChannel.Download)
+    })
+  })
+})
+
+describe('UpdateDialog: progress uses a distinct semantic fill', () => {
+  it('renders the progress fill with primary over a muted track', async () => {
+    render(<UpdateDialog />)
+    act(() => { listeners.get(UpdateChannel.Available)!(UPDATE_INFO) })
+    invokeStrictMock.mockReturnValue(new Promise(() => {}))
+    fireEvent.click(await screen.findByRole('button', { name: 'Download' }))
+    act(() => { listeners.get(UpdateChannel.DownloadProgress)!({ percent: 42 }) })
+
+    const track = document.querySelector('.bg-muted')
+    const fill = track?.querySelector('.bg-primary')
+    expect(track).not.toBeNull()
+    expect(fill).not.toBeNull()
+    expect((fill as HTMLElement).style.width).toBe('42%')
+  })
+})
+
+describe('UpdateDialog: reopened download state', () => {
+  it('keeps the active download completion when a same-identity reopen restores progress', async () => {
+    let settleDownload: (result: { success: boolean }) => void = () => {}
+    invokeStrictMock.mockImplementationOnce(() => new Promise((resolve) => { settleDownload = resolve }))
+    render(<UpdateDialog />)
+    act(() => { listeners.get(UpdateChannel.Available)!(UPDATE_INFO) })
+    fireEvent.click(await screen.findByRole('button', { name: 'Download' }))
+    act(() => {
+      listeners.get(UpdateChannel.Available)!({
+        ...UPDATE_INFO,
+        downloadState: { stage: 'downloading', progress: 37 },
+      })
+    })
+    settleDownload({ success: true })
+
+    expect(await screen.findByRole('button', { name: 'Install & Restart' })).toBeInTheDocument()
+  })
+
+  it('keeps the active download failure when a same-identity reopen restores progress', async () => {
+    let settleDownload: (result: { success: boolean; error?: string }) => void = () => {}
+    invokeStrictMock.mockImplementationOnce(() => new Promise((resolve) => { settleDownload = resolve }))
+    render(<UpdateDialog />)
+    act(() => { listeners.get(UpdateChannel.Available)!(UPDATE_INFO) })
+    fireEvent.click(await screen.findByRole('button', { name: 'Download' }))
+    act(() => {
+      listeners.get(UpdateChannel.Available)!({
+        ...UPDATE_INFO,
+        downloadState: { stage: 'downloading', progress: 37 },
+      })
+    })
+    settleDownload({ success: false, error: 'temporary download failure' })
+
+    expect(await screen.findByText('Download failed: temporary download failure')).toBeInTheDocument()
+  })
+
+  it('renders the latest progress supplied when the cached overlay is shown again', async () => {
+    render(<UpdateDialog />)
+    act(() => {
+      listeners.get(UpdateChannel.Available)!({
+        ...UPDATE_INFO,
+        downloadState: { stage: 'downloading', progress: 42 },
+      })
+    })
+
+    expect(await screen.findByText('Downloading... 42%')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Download' })).toBeNull()
+  })
+
+  it('ignores a superseded download completion after an update payload replaces it', async () => {
+    let settleDownload: (result: { success: boolean; error?: string }) => void = () => {}
+    invokeStrictMock.mockImplementationOnce(() => new Promise((resolve) => { settleDownload = resolve }))
+    render(<UpdateDialog />)
+    act(() => { listeners.get(UpdateChannel.Available)!(UPDATE_INFO) })
+    fireEvent.click(await screen.findByRole('button', { name: 'Download' }))
+    act(() => {
+      listeners.get(UpdateChannel.Available)!({
+        version: '2.0.0',
+        downloadUrl: 'https://example.com/2.0.0-replacement.dmg',
+      })
+    })
+    settleDownload({ success: false, error: 'Update changed during download' })
+
+    expect(await screen.findByText('New version 2.0.0 is available.')).toBeInTheDocument()
+    expect(screen.queryByText('Download failed: Update changed during download')).toBeNull()
+  })
+})
+
+describe('UpdateDialog: Available subscription must be live before notifyOverlayReady() fires', () => {
+  it('does not miss an Available event main pushes synchronously in response to the ready notification', async () => {
+    // Simulate main responding to OverlayChannel.Ready by synchronously
+    // delivering a pending Available — this only reaches the dialog's own
+    // listener if that listener's effect ran BEFORE the notifyOverlayReady()
+    // effect. With the buggy declaration order this leaves `info` null
+    // forever (component renders nothing, WCV stays an invisible overlay).
+    sendMock.mockImplementation((channel: string) => {
+      if (channel === OverlayChannel.Ready) {
+        listeners.get(UpdateChannel.Available)?.(UPDATE_INFO)
+      }
+    })
+
+    render(<UpdateDialog />)
+
+    expect(await screen.findByText('New version 2.0.0 is available.')).toBeInTheDocument()
+  })
+})

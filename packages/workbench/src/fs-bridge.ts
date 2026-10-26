@@ -1,0 +1,108 @@
+/**
+ * Pure `/__fs` bridge calls + workspace-URI helpers: talk only to the COI
+ * server's `/__fs/*` endpoints over `fetch`, no monaco/vscode dependency.
+ * Kept separate from file-workspace.ts (which wires these into the monaco
+ * file service) so a consumer that only needs the bridge itself — the WAL
+ * audit decorator, or a unit test — never pulls in the full
+ * monaco-vscode-api runtime (its internal CSS assets are unresolvable outside
+ * a browser/Vite-transformed environment).
+ */
+
+export const WORKSPACE_FILE_ROOT = 'file:///workspace'
+
+/**
+ * In-workspace `@types` root holding all devtools-injected ambient typings. TS
+ * module resolution auto-discovers `node_modules/@types/*`, so the dd/wx (and
+ * contributed) packages land here. Lives under the workspace root (the web
+ * tsserver only reads inside it), kept out of the Explorer via `files.exclude`,
+ * and never flushed back to disk. dimina projects have no real `node_modules` at
+ * the editor root, so reusing that path is safe.
+ */
+export const TYPES_ROOT = 'node_modules/@types'
+
+/**
+ * `[name, type, size?, mtimeMs?]` — type: 1 file, 2 dir. `size`/`mtimeMs` are
+ * only ever populated for FILE entries and are the raw `fs.Stats` values from the
+ * devtools main process (`readdirWithin`, project-fs.ts). A minimal
+ * evolution of the original `[name, type]` shape — every existing
+ * destructuring call site (`const [name, type] of entries`) stays valid
+ * unchanged, since JS array destructuring ignores extra trailing elements.
+ */
+export type FsEntry = [name: string, type: number, size?: number, mtimeMs?: number]
+
+export async function bridgeReaddir(baseUrl: string, rel: string): Promise<FsEntry[]> {
+  const u = new URL(`${baseUrl}__fs/readdir`)
+  u.searchParams.set('p', rel)
+  const res = await fetch(u.toString())
+  // 409 = no active project yet (ENOACTIVE). Treat as an empty tree rather than
+  // throwing: the workbench may attach before a project is open, and erroring
+  // would spew uncaught failures + leave file:///workspace unresolvable.
+  if (res.status === 409) return []
+  if (!res.ok) throw new Error(`readdir ${rel}: ${res.status}`)
+  return (await res.json()) as FsEntry[]
+}
+
+export async function bridgeRead(baseUrl: string, rel: string): Promise<Uint8Array> {
+  const u = new URL(`${baseUrl}__fs/read`)
+  u.searchParams.set('p', rel)
+  const res = await fetch(u.toString())
+  // `status` is attached so callers can tell "file does not exist" (404 —
+  // the COI server maps ENOENT to it) from a transient bridge failure: the
+  // sync engine must only treat the former as a deletion.
+  if (!res.ok) throw Object.assign(new Error(`read ${rel}: ${res.status}`), { status: res.status })
+  return new Uint8Array(await res.arrayBuffer())
+}
+
+export async function bridgeWrite(baseUrl: string, rel: string, content: Uint8Array): Promise<void> {
+  const u = new URL(`${baseUrl}__fs/write`)
+  u.searchParams.set('p', rel)
+  const res = await fetch(u.toString(), { method: 'POST', body: content.slice() })
+  if (!res.ok) throw new Error(`write ${rel}: ${res.status}`)
+}
+
+/** Delete a file through the workbench bridge. */
+export async function bridgeDelete(baseUrl: string, rel: string): Promise<void> {
+  const u = new URL(`${baseUrl}__fs/delete`)
+  u.searchParams.set('p', rel)
+  const res = await fetch(u.toString(), { method: 'POST' })
+  if (!res.ok) throw new Error(`delete ${rel}: ${res.status}`)
+}
+
+/** Structural URI shape (just `.toString()`) so callers don't need the real monaco `URI` class to use {@link relFromWorkspaceUri}. */
+export interface WorkspaceUriLike {
+  toString(): string
+}
+
+/**
+ * Resolve a `file:///workspace/<rel>` URI to its project-relative bridge path,
+ * or `null` when it falls outside {@link WORKSPACE_FILE_ROOT} or names
+ * devtools-injected tooling that must never round-trip to disk: the injected
+ * `@types` packages live under memfs-only `node_modules/`, and a user
+ * tsconfig/jsconfig we merged the typings names into must keep its on-disk
+ * copy untouched — the merge lives only in the memfs mirror. Shared by
+ * `flushFileWorkspaceSaveToDisk` and the WAL audit decorator so both agree on
+ * which saves are disk-backed.
+ */
+export function relFromWorkspaceUri(uri: WorkspaceUriLike): string | null {
+  const prefix = WORKSPACE_FILE_ROOT + '/'
+  const full = uri.toString()
+  if (!full.startsWith(prefix)) return null
+  const encodedRel = full.slice(prefix.length)
+  // A workspace URI must name path segments directly. Treat encoded separators
+  // and malformed escapes as outside the bridge contract rather than decoding
+  // them into a path the main-process fence did not receive verbatim.
+  if (/%2f|%5c/i.test(encodedRel)) return null
+  let rel: string
+  try {
+    rel = decodeURIComponent(encodedRel)
+  } catch {
+    return null
+  }
+  if (!rel || rel.includes('\\') || rel.split('/').some((part) => !part || part === '.' || part === '..')) return null
+  // The bare directory must be rejected too, not just its descendants — the
+  // previous `rel === 'node_modules/'` arm was unreachable, since a trailing
+  // slash is already covered by the `startsWith` test.
+  if (rel === 'node_modules' || rel.startsWith('node_modules/')) return null
+  if (rel === 'jsconfig.json' || rel === 'tsconfig.json') return null
+  return rel
+}

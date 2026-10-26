@@ -1,0 +1,21 @@
+name: 功能建议
+description: 提出一个现在做不到、或做起来很别扭的事
+title: "feat: "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想完成什么
+      description: 先写使用场景，再写现在缺了哪一步。
+      placeholder: 我想在自己的 Electron 应用里嵌入模拟器，但不知道怎样拿到当前页面的 WXML。
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: 你希望怎样做
+      description: 如果已经有想法，写下期望的用法。没有也没关系。
+    validations:
+      required: false

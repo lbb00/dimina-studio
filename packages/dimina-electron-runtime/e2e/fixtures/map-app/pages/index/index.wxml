@@ -1,0 +1,4 @@
+<view class="wrap">
+  <map wx:if="{{mapVisible}}" id="m" />
+  <button class="btn" data-action="toggle-map" bindtap="onToggleMap">toggle map</button>
+</view>

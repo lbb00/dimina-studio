@@ -1,0 +1,86 @@
+import { describe, expect, it } from 'vitest'
+import { DEVTOOLS_KEPT_VIEW_IDS, buildCustomizeTabsScript, buildDevtoolsSoftMenuScript } from './devtools-tabs.js'
+
+describe('DEVTOOLS_KEPT_VIEW_IDS', () => {
+  it('keeps Elements / Console / Sources / Network in the default bar', () => {
+    // Sources is kept so a source-link click NOT routed to Monaco (build/runtime
+    // chunks, framework frames) still has a panel to reveal in. Stays in the
+    // DevTools default order (Sources between Console and Network) — never
+    // reordered, because the front-end maps tab clicks to panel ids by the tab
+    // container's child index, and DOM reordering desyncs that mapping.
+    expect([...DEVTOOLS_KEPT_VIEW_IDS]).toEqual(['elements', 'console', 'sources', 'network'])
+  })
+})
+
+describe('buildCustomizeTabsScript', () => {
+  it('produces a self-contained IIFE wrapped in try/catch (silent degradation)', () => {
+    const src = buildCustomizeTabsScript()
+    expect(src.startsWith('(function(){try{')).toBe(true)
+    expect(src.trimEnd().endsWith('})()')).toBe(true)
+  })
+
+  it('embeds the keep-list as a JSON data literal, not interpolated identifiers', () => {
+    // ids appear only inside a JSON.parse(...) string literal — never as bare code
+    // tokens — so a hostile id can never become executable JS.
+    const src = buildCustomizeTabsScript(['elements', 'console'])
+    expect(src).toContain('JSON.parse(')
+    expect(src).toContain('elements')
+    expect(src).toContain('console')
+  })
+
+  it('drives the DevTools view registry (not globalThis.UI / DOM)', () => {
+    const src = buildCustomizeTabsScript()
+    expect(src).toContain("import(") // ESM module resolution
+    expect(src).toContain('./ui/legacy/legacy.js')
+    expect(src).toContain('maybeRemoveViewExtension')
+    expect(src).toContain('registerViewExtension')
+    expect(src).toContain('getRegisteredViewExtensions')
+  })
+
+  it('keeps non-kept panels reachable by registering them transient (not deleting)', () => {
+    const src = buildCustomizeTabsScript()
+    expect(src).toContain("persistence='transient'")
+  })
+
+  it('keeps non-kept panels reachable by registering them transient, with no DOM reordering', () => {
+    const src = buildCustomizeTabsScript()
+    // Sources is kept and stays in the DevTools default order — the script
+    // must NOT carry any reorder/drag logic (insertBefore or CSS order) that
+    // mis-maps clicks to the wrong panel.
+    expect(src).not.toContain('insertBefore')
+    expect(src).not.toContain('style.order')
+    expect(src).not.toContain('WANT_SOURCES_LAST')
+    expect(src).toContain("persistence='transient'")
+    expect(src).toContain('Sources')
+  })
+
+  it('suppresses the locale infobar via the official host preference', () => {
+    const src = buildCustomizeTabsScript()
+    expect(src).toContain('disable-locale-info-bar')
+    expect(src).toContain('setPreference')
+  })
+
+  it('bounds its DOM fallback poll so it cannot spin forever', () => {
+    const src = buildCustomizeTabsScript()
+    expect(src).toContain('clearInterval')
+    expect(src).toContain('tr>120')
+  })
+})
+
+describe('buildDevtoolsSoftMenuScript', () => {
+  it('forces ContextMenu#show to render page menus (useSoftMenu = true)', () => {
+    const src = buildDevtoolsSoftMenuScript()
+    expect(src).toContain('useSoftMenu = true')
+    expect(src).toContain('prototype.show')
+    expect(src).toContain('ContextMenu.ContextMenu')
+  })
+
+  it('is a self-contained IIFE that cannot throw when EUI is absent', () => {
+    const src = buildDevtoolsSoftMenuScript()
+    expect(src).toContain('typeof C.prototype.show')
+    expect(src).toContain('catch (_)')
+    // Must NOT flip the host-wide isHostedMode flag — that breaks the
+    // front-end's target data flow (Console/Network panels go empty).
+    expect(src).not.toContain('isHostedMode')
+  })
+})

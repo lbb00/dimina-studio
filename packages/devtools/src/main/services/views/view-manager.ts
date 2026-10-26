@@ -1,0 +1,471 @@
+import type { WebContents } from 'electron'
+import type { NativeDeviceInfo } from '../../../shared/ipc-channels.js'
+// eslint-disable-next-line no-restricted-syntax -- grandfathered(workbench-context): shrink-only
+import { type WorkbenchContext } from '../workbench-context.js'
+import type { PlacementSnapshot } from 'electron-deck/layout'
+import type { DevtoolsExtra } from '../../../shared/view-ids.js'
+import { createSafeAreaController } from '../safe-area/index.js'
+import { createPlacementReconciler } from './placement-reconciler.js'
+import { createWorkbenchView } from './workbench-view.js'
+import { createDevtoolsHost } from './native-simulator-devtools-host.js'
+import { createHostToolbarView, type HostToolbarControl } from './host-toolbar-view.js'
+import { createHostSidebarView, type HostSidebarViewManagerMembers } from './host-sidebar-view.js'
+import { createHostDialogView, type HostDialogViewManagerMembers } from './host-dialog-view.js'
+import {
+  createOverlayPanelsView,
+  type OverlayPanelsView,
+  type TooltipShowPayload,
+} from './overlay-panels-view.js'
+
+export type { TooltipShowPayload }
+import { createNativeSimulatorView } from './native-simulator-view.js'
+
+export {
+  resolveProjectEditorTarget,
+  type ProjectEditorTarget,
+} from './resolve-project-editor-target.js'
+
+/**
+ * Context surface used by the ViewManager. We only need a small slice of the
+ * full WorkbenchContext here; typing it this way documents the actual dependency.
+ */
+export interface ViewManagerContext {
+  windows: WorkbenchContext['windows']
+  rendererDir: string
+  /**
+   * Per-webContents connection registry. The native-host
+   * simulator WebContentsView is acquired here so the registry tracks that
+   * trusted webContents and tears its per-wc resources (the custom-api bridge
+   * `ipcMain.on`) down deterministically on destroy. Required:
+   * `createWorkbenchContext` always supplies it.
+   */
+  connections: WorkbenchContext['connections']
+  /**
+   * Shared CDP session broker (see cdp-session/index.ts). safe-area acquires
+   * render-guest debugger leases through it instead of attaching directly, so
+   * it shares sessions with elements-forward/render-inspect/network-forward
+   * rather than fighting them for exclusive ownership. Optional so partial
+   * test contexts compile (safe-area falls back to a private broker
+   * instance); `createWorkbenchContext` always supplies the real one.
+   */
+  cdpSessionBroker?: WorkbenchContext['cdpSessionBroker']
+  /** Active project root used to validate/open console source locations. */
+  workspace?: WorkbenchContext['workspace']
+  /**
+   * Absolute path to the simulator preload bundle. Only consumed by the
+   * native-host simulator WebContentsView (`attachNativeSimulator`); the
+   * default `<webview>` path gets its preload from the session-registered
+   * frame preload instead. Optional so partial test contexts compile.
+   */
+  preloadPath?: string
+  notify: WorkbenchContext['notify']
+  bridge?: WorkbenchContext['bridge']
+  /**
+   * Native-host network forwarder. `attachNativeSimulator` hands it the freshly
+   * created simulator WebContentsView (`networkForward.attachSimulator`) so it can attach the
+   * CDP debugger, and the DevTools front-end host wc (`setDevtoolsHost`) so it can
+   * inject that WCV's Network.* events into the native Network tab (service-host
+   * console line is the fallback). Optional so partial test contexts compile.
+   */
+  networkForward?: WorkbenchContext['networkForward']
+  /**
+   * Always-on console fan-out (set by `installBridgeRouter`). The service-console
+   * capture feeds service-layer `consoleAPICalled` entries here so they reach
+   * automation; mirrors how render entries arrive via the bridge. Optional so
+   * partial test contexts compile.
+   */
+  consoleForwarder?: WorkbenchContext['consoleForwarder']
+  /**
+   * Per-context registry of host-registered simulator custom APIs. The
+   * native-host simulator is a top-level WebContentsView with no embedder
+   * renderer, so `attachNativeSimulator` dispatches the simulator-side
+   * `__diminaCustomApis` bridge straight to this registry (the default
+   * `<webview>` path proxies through the trusted main renderer instead).
+   * Optional so partial test contexts compile.
+   */
+  simulatorApis?: WorkbenchContext['simulatorApis']
+  /**
+   * Host-registered UI extensions that follow the native simulator WCV.
+   * Optional only for focused view-manager test doubles.
+   */
+  simulatorUiExtensions?: WorkbenchContext['simulatorUiExtensions']
+}
+
+/**
+ * Unified lifecycle manager for Electron WebContentsView overlays.
+ *
+ * Owns creation / attachment / detachment / positioning / destruction of
+ * every overlay view hung off the main window's contentView (simulator
+ * DevTools, settings, popover). All `new WebContentsView`, `addChildView`,
+ * `removeChildView`, `webContents.destroy()` and overlay `setBounds` calls
+ * should live here — IPC handlers just call into the manager.
+ *
+ * The code editor IS an overlay: the embedded VS Code workbench is a
+ * main-process WebContentsView (`attachWorkbench`) hung off the main window's
+ * contentView, like the other overlays. The main window's own renderer is the
+ * content root and is not managed here.
+ *
+ * This module is the composition root: each view domain lives in its own
+ * factory module (simulator, devtools-host, workbench, host-toolbar, overlay
+ * panels) and shares a single injected placement reconciler; this file wires
+ * them together and exposes their combined method surface.
+ */
+export interface ViewManager extends Pick<
+  OverlayPanelsView,
+  | 'showSettings'
+  | 'hideSettings'
+  | 'showPopover'
+  | 'hidePopover'
+  | 'prepareTooltip'
+  | 'showTooltip'
+  | 'hideTooltip'
+  | 'markOverlayReady'
+  | 'applyTooltipMeasurement'
+  | 'showProjectCreateDialog'
+  | 'hideProjectCreateDialog'
+  | 'showUpdateDialog'
+  | 'hideUpdateDialog'
+  | 'notifyUpdateDownloadProgress'
+  | 'showDevicePicker'
+  | 'hideDevicePicker'
+  | 'getProjectCreateDialogWebContentsId'
+  | 'getUpdateDialogWebContentsId'
+  | 'getDevicePickerWebContentsId'
+  | 'showCompileStatusDetails'
+  | 'hideCompileStatusDetails'
+  | 'getCompileStatusDetailsWebContentsId'
+>,
+  HostSidebarViewManagerMembers,
+  HostDialogViewManagerMembers {
+  /** Read-only native view ownership used by process diagnostics. */
+  listViewWebContents(): Array<{ viewId: string; webContentsId: number; getOSProcessId: () => number }>
+  // ── DevTools ───────────────────────────────────────────────────────────
+  /**
+   * NATIVE-HOST ONLY. Create the simulator itself as a top-level
+   * WebContentsView (not a renderer `<webview>` guest) loading `simulatorUrl`,
+   * and treat its webContents as THE simulator webContents (so
+   * `getSimulatorWebContents` resolves it and the spawn/SIMULATOR_EVENTS
+   * pipeline flows through it). This is required because Electron
+   * force-disables the `<webview>` tag inside a webview guest, so a
+   * `<webview>`-in-`<webview>` topology can never host DeviceShell's
+   * per-page render-host `<webview>`s. A top-level WebContentsView's webContents
+   * is NOT a guest and CAN host them. Then wires the DevTools/console view on
+   * top of it via `attachNativeSimulatorDevtoolsHost`. Neither view is added
+   * to the contentView here — both mount only when the renderer's view anchors
+   * publish a non-zero rect (`setNativeSimulatorViewBounds` /
+   * `setSimulatorDevtoolsBounds`). No-op (logs) when `preloadPath` is unset.
+   * `simWidth` rides the wire for schema compatibility but is unused: all
+   * geometry is anchor-published.
+   */
+  attachNativeSimulator(simulatorUrl: string, simWidth: number): Promise<void>
+  /**
+   * Soft-reload the LIVE native simulator after a watcher rebuild: forward a
+   * SIMULATOR_EVENTS.RELAUNCH (carrying the rebuilt simulator URL) into the
+   * existing WCV so the shell boots a new app session in place and swaps when
+   * it is ready — the phone shell never unmounts. Returns false (no event
+   * sent) when there is no live simulator view or its shell has not finished
+   * its first boot (first render guest did-finish-load); the caller then falls
+   * back to the hard attachNativeSimulator rebuild.
+   */
+  softReloadNativeSimulator(simulatorUrl: string): boolean
+  /**
+   * Style-only fast path after a watcher rebuild: hot-swap the render-host
+   * stylesheets in place (no shell respawn), preserving the page stack / form
+   * state / focus. Returns false when no live+ready guest exists so the caller
+   * falls back to the full soft reload.
+   */
+  refreshSimulatorStyles(): boolean
+  /**
+   * Destroy and null out the simulator view (e.g. on simulator detach).
+   * Also destroys the cached settings view and hides the popover —
+   * preserves the aggregate `detachAllViews` behaviour of the previous
+   * `windows/views.ts` module, which every detach call relied on.
+   */
+  detachSimulator(): void
+
+  // ── Aggregate ──────────────────────────────────────────────────────────
+  /** Re-apply layout for every currently visible overlay (on window resize). */
+  repositionAll(): void
+  /**
+   * Destroy the PROJECT-scoped views: the simulator (with its devtools host
+   * and settings/popover overlays), the embedded workbench editor, and the
+   * per-guest safe-area sessions. Deliberately does NOT touch the host
+   * toolbar — its webContents lifecycle belongs to the HOST, so it survives
+   * closing a project. This is what `workspace.closeProject()` calls.
+   */
+  disposeProjectViews(): void
+  /**
+   * Destroy ALL managed views: everything `disposeProjectViews()` covers PLUS
+   * the host toolbar (its view, port channel, and the ref-counted
+   * session-runtime preload registration). App/window teardown only — the
+   * context's DisposableRegistry runs this so the toolbar's session-level
+   * resources are released exactly once, at the end of the manager's life.
+   */
+  disposeAll(): void
+
+  // ── State queries ─────────────────────────────────────────────────────
+  /** Return the webContents ID of the currently attached simulator. */
+  getSimulatorWebContentsId(): number | null
+  /** Return the live webContents of the currently attached simulator, or null. */
+  getSimulatorWebContents(): WebContents | null
+  /** Return the active project path bound to the current native simulator. */
+  getSimulatorProjectPath(): string | null
+  /** Return the settings overlay's WebContents (for renderer-notifier). */
+  getSettingsWebContents(): WebContents | null
+  /** Return the webContents ID of the settings overlay if alive, else null. */
+  getSettingsWebContentsId(): number | null
+  /** Return the webContents ID of the popover overlay if alive, else null. */
+  getPopoverWebContentsId(): number | null
+  /** Return the webContents ID of the tooltip overlay if alive, else null. */
+  getTooltipWebContentsId(): number | null
+  /**
+   * Return the webContents ID of the host-toolbar overlay if alive, else null.
+   * The host-toolbar WCV is the one overlay whose OWN renderer drives an IPC
+   * channel back to main (the reverse size-advertiser), so the sender policy
+   * must trust its id — see `createWorkbenchSenderPolicy`.
+   */
+  getHostToolbarWebContentsId(): number | null
+  /**
+   * Return the last host-toolbar height NOTIFIED to the main-window renderer
+   * (an advertiser report in `'auto'` mode, a `setHeightMode({ fixed })` pin,
+   * or 0 after `hostToolbar.hide()`); 0 before any notify. The renderer pulls
+   * this on project-view mount to REPLAY a height whose push it missed — the
+   * toolbar's size-advertiser deduplicates and never re-reports, so a notify
+   * fired while no project view is mounted (cold start on the project list;
+   * always on close-project → reopen) would otherwise be lost forever.
+   */
+  getHostToolbarHeight(): number
+
+  // ── Compound operations (used by IPC handlers) ────────────────────────
+  /**
+   * NATIVE-HOST ONLY. Re-push the selected device's CSS `env(safe-area-inset-*)`
+   * override to every attached render-host guest (on device change). New guests
+   * pick it up automatically when they attach (`did-attach-webview`).
+   */
+  reapplySafeArea(device: NativeDeviceInfo | null): void
+  /**
+   * Window-resize entry point. Re-applies the settings overlay's bounds only.
+   * Simulator + DevTools overlay geometry is anchor-published (the renderer's
+   * ResizeObserver re-measures on the same resize), so no static re-apply here.
+   */
+  resize(simWidth: number): void
+
+  // ── Renderer-driven overlay bounds ────────────────────────────────────
+  /**
+   * Apply the renderer's window-level placement snapshot — the single source of
+   * truth for every managed native view's bounds/visibility/z-order. Merged with
+   * main-owned settings/popover desired state and reconciled against the actual
+   * view tree.
+   */
+  setPlacementSnapshot(snapshot: PlacementSnapshot<DevtoolsExtra>): void
+  /**
+   * Hand out a fresh generation seed for a renderer bootstrap. See
+   * `PlacementReconciler.allocateGeneration`'s doc-comment for why this
+   * replaces a wall-clock (`Date.now()`) seed.
+   */
+  allocatePlacementGeneration(): number
+
+  // ── Embedded workbench editor WebContentsView ──────────────────────
+  /**
+   * Lazily create the workbench WebContentsView, load `<url>index.html`, and
+   * add it to the contentView. `url` is the COI server's base URL (trailing
+   * slash), which serves the workbench bundle with the SharedArrayBuffer
+   * isolation headers. Idempotent: a second call is a no-op.
+   */
+  attachWorkbench(url: string): Promise<void>
+  /**
+   * Store the workbench COI base URL without loading it. The heavy
+   * WebContentsView load is deferred to the first visible
+   * `setWorkbenchBounds` — and further deferred while `holdWorkbenchAttach`
+   * is in force — keeping it off the app boot critical path.
+   */
+  setWorkbenchSource(url: string): void
+  /** Destroy the workbench editor view (teardown). No-op if never attached. */
+  detachWorkbench(): void
+  /**
+   * Close the workbench attach gate: while held (and the view does not exist
+   * yet), the lazy attach is deferred so the editor's heavy load stays out of
+   * a project open's boot-critical window (teardown + first compile). Returns
+   * an idempotent release fn bound to this hold; a newer hold supersedes it
+   * (its release becomes a no-op), explicit user intent (openFileInWorkbench)
+   * opens the gate, and a 3s cap self-releases with a warn so the editor is
+   * never deferred unboundedly. The gate never hides or destroys a live view.
+   */
+  holdWorkbenchAttach(): () => void
+  /**
+   * Void the current workbench attach hold WITHOUT the release replay. For
+   * teardown paths that preempt an in-flight open (closeProject, disposeAll):
+   * the superseded open's late release or its cap firing must not rebuild the
+   * editor view after the project is gone. No-op when nothing is held.
+   */
+  cancelWorkbenchAttachHold(): void
+  /**
+   * Queue a project-file reveal for the embedded workbench at a 1-based
+   * line/column (the open-in-editor target coordinate convention). A request
+   * received before lazy attach or boot-ready is retained; `true` means it was
+   * accepted by that latest-request queue.
+   */
+  openFileInWorkbench(relPath: string, line: number, column: number): boolean
+
+  // ── Host-controllable toolbar WebContentsView ─────────────────────────
+  /**
+   * Reverse size-advertiser sink: the toolbar WCV's own renderer advertises
+   * its intrinsic content height (block-axis extent); we retain it as the
+   * last-notified height (`getHostToolbarHeight`) and push it to the
+   * main-window renderer so the placeholder div resizes (closing the
+   * dynamic-height loop). Ignored ENTIRELY while a `{ fixed }` height mode is
+   * pinned via `hostToolbar.setHeightMode` — dropped reports neither notify
+   * nor touch the retained value (the session-resident advertiser always
+   * runs, so its reports must not fight a host-pinned height).
+   */
+  setHostToolbarHeight(extent: number): void
+  /**
+   * Host-facing control surface for the toolbar WebContentsView. The host
+   * host loads its own content into it (`loadURL` / `loadFile`) and fully drives
+   * it. Lazily creates the underlying view on the first load call.
+   */
+  readonly hostToolbar: HostToolbarControl
+}
+
+/**
+ * Build a ViewManager bound to the given context. The returned object is the
+ * only component allowed to instantiate or add/remove overlay WebContentsViews.
+ *
+ * All view-related mutable state lives inside the per-domain factory closures
+ * (and the single placement reconciler) below, never on the context object.
+ */
+export function createViewManager(ctx: ViewManagerContext): ViewManager {
+  // CSS env(safe-area-inset-*) simulation for render-host guests (per device).
+  // Driven from did-attach-webview in the simulator domain and re-pushed on
+  // device change via reapplySafeArea. Torn down in disposeAll.
+  const safeArea = createSafeAreaController({ connections: ctx.connections, broker: ctx.cdpSessionBroker })
+
+  // The single level-triggered placement reconciler every view domain shares —
+  // the sole owner of placement state (docs/project-window-layout.md). Each
+  // domain registers exactly one view slot with it.
+  const reconciler = createPlacementReconciler(ctx)
+
+  const workbench = createWorkbenchView(ctx, reconciler)
+  const devtoolsHost = createDevtoolsHost(ctx, reconciler, {
+    openFileInWorkbench: workbench.openFileInWorkbench,
+  })
+  // hostToolbar and the overlay panels form a height cycle: the toolbar height
+  // offsets the overlays' top edge, and a toolbar height change re-applies the
+  // present overlays. The toolbar receives a thunk into the (hoisted) function
+  // declaration below so the reference resolves at runtime — after the overlay
+  // panels exist — while both domains stay plain const bindings.
+  const hostToolbar = createHostToolbarView(ctx, reconciler, {
+    reapplyPresentOverlays: () => reapplyToolbarDependentOverlays(),
+  })
+  // Sidebar and dialog are host-scoped like the toolbar (survive project
+  // close/reopen) but carry no height-cycle dependency on the overlay panels,
+  // so unlike hostToolbar they need no thunk into this scope.
+  const hostSidebar = createHostSidebarView(ctx, reconciler)
+  const hostDialog = createHostDialogView(ctx, reconciler)
+  const overlayPanels = createOverlayPanelsView(ctx, reconciler, {
+    getHostToolbarHeight: hostToolbar.getHostToolbarHeight,
+  })
+  const nativeSimulator = createNativeSimulatorView(ctx, reconciler, {
+    safeArea,
+    devtoolsHost,
+    overlayPanels,
+  })
+
+  function reapplyToolbarDependentOverlays(): void {
+    overlayPanels.reapplyPresentOverlays()
+  }
+
+  function disposeProjectViews(): void {
+    // Aggregate simulator detach first (native simulator + devtools host +
+    // settings/popover), then the workbench, then the per-guest safe-area
+    // sessions. The host toolbar is exempt: it is HOST-scoped (the host loads
+    // and drives it; the height-replay machinery exists precisely for the
+    // close-project → reopen flow), so a project's teardown must not kill it.
+    nativeSimulator.detachSimulator()
+    // Embedded workbench editor view (no-op when the host never opted in;
+    // also removes the devtools-theme sync listener).
+    workbench.detachWorkbench()
+    safeArea.dispose()
+  }
+
+  function disposeAll(): void {
+    // App-level teardown invalidates any in-flight open's attach hold first,
+    // so the held-detach preserve path below can't keep a desired around for
+    // a release/cap replay to rebuild.
+    workbench.cancelWorkbenchAttachHold()
+    disposeProjectViews()
+    // Host-scoped teardown: the toolbar/sidebar/dialog views, their port
+    // channels, and their ref-counted session-runtime preload registrations.
+    hostToolbar.dispose()
+    hostSidebar.dispose()
+    hostDialog.dispose()
+    // Devtools-owned overlay-panel dialogs (project-create/update) — never
+    // torn down by disposeProjectViews(), they'd otherwise outlive every
+    // other view once the app tears down.
+    overlayPanels.destroyDialogs()
+  }
+
+  return {
+    listViewWebContents: reconciler.listViewWebContents,
+    attachNativeSimulator: nativeSimulator.attachNativeSimulator,
+    softReloadNativeSimulator: nativeSimulator.softReloadNativeSimulator,
+    refreshSimulatorStyles: nativeSimulator.refreshSimulatorStyles,
+    detachSimulator: nativeSimulator.detachSimulator,
+    reapplySafeArea: (device) => safeArea.reapplyAll(device),
+    showSettings: overlayPanels.showSettings,
+    hideSettings: overlayPanels.hideSettings,
+    showPopover: overlayPanels.showPopover,
+    hidePopover: overlayPanels.hidePopover,
+    prepareTooltip: overlayPanels.prepareTooltip,
+    showTooltip: overlayPanels.showTooltip,
+    hideTooltip: overlayPanels.hideTooltip,
+    markOverlayReady: overlayPanels.markOverlayReady,
+    applyTooltipMeasurement: overlayPanels.applyTooltipMeasurement,
+    showProjectCreateDialog: overlayPanels.showProjectCreateDialog,
+    hideProjectCreateDialog: overlayPanels.hideProjectCreateDialog,
+    showUpdateDialog: overlayPanels.showUpdateDialog,
+    hideUpdateDialog: overlayPanels.hideUpdateDialog,
+    notifyUpdateDownloadProgress: overlayPanels.notifyUpdateDownloadProgress,
+    showDevicePicker: overlayPanels.showDevicePicker,
+    hideDevicePicker: overlayPanels.hideDevicePicker,
+    showCompileStatusDetails: overlayPanels.showCompileStatusDetails,
+    hideCompileStatusDetails: overlayPanels.hideCompileStatusDetails,
+    getProjectCreateDialogWebContentsId: overlayPanels.getProjectCreateDialogWebContentsId,
+    getUpdateDialogWebContentsId: overlayPanels.getUpdateDialogWebContentsId,
+    getDevicePickerWebContentsId: overlayPanels.getDevicePickerWebContentsId,
+    getCompileStatusDetailsWebContentsId: overlayPanels.getCompileStatusDetailsWebContentsId,
+    repositionAll: () => {
+      overlayPanels.reapplyPresentOverlays()
+      hostDialog.reposition()
+    },
+    disposeProjectViews,
+    disposeAll,
+    getSimulatorWebContentsId: nativeSimulator.getSimulatorWebContentsId,
+    getSimulatorWebContents: nativeSimulator.getSimulatorWebContents,
+    getSimulatorProjectPath: nativeSimulator.getSimulatorProjectPath,
+    getSettingsWebContents: overlayPanels.getSettingsWebContents,
+    getSettingsWebContentsId: overlayPanels.getSettingsWebContentsId,
+    getPopoverWebContentsId: overlayPanels.getPopoverWebContentsId,
+    getTooltipWebContentsId: overlayPanels.getTooltipWebContentsId,
+    getHostToolbarWebContentsId: hostToolbar.getHostToolbarWebContentsId,
+    getHostToolbarHeight: hostToolbar.getHostToolbarHeight,
+    resize: () => overlayPanels.applySettingsBoundsIfPresent(),
+    setPlacementSnapshot: reconciler.setPlacementSnapshot,
+    allocatePlacementGeneration: reconciler.allocateGeneration,
+    attachWorkbench: workbench.attachWorkbench,
+    setWorkbenchSource: workbench.setWorkbenchSource,
+    detachWorkbench: workbench.detachWorkbench,
+    openFileInWorkbench: workbench.openFileInWorkbench,
+    holdWorkbenchAttach: workbench.holdWorkbenchAttach,
+    cancelWorkbenchAttachHold: workbench.cancelWorkbenchAttachHold,
+    setHostToolbarHeight: hostToolbar.setHostToolbarHeight,
+    hostToolbar: hostToolbar.control,
+    getHostSidebarWebContentsId: hostSidebar.getHostSidebarWebContentsId,
+    getHostSidebarWidth: hostSidebar.getHostSidebarWidth,
+    setHostSidebarWidth: hostSidebar.setHostSidebarWidth,
+    hostSidebar: hostSidebar.control,
+    getHostDialogWebContentsId: hostDialog.getHostDialogWebContentsId,
+    reportHostDialogMeasuredExtent: hostDialog.reportMeasuredExtent,
+    hostDialog: hostDialog.control,
+  }
+}

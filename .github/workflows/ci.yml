@@ -1,0 +1,245 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+
+# A newer push to the same ref supersedes the running verification — cancel it
+# instead of finishing a result nobody will read.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # lint + check-types need no test artifacts, so they run on their own runner
+  # in parallel with the test/gate job instead of serializing in front of it.
+  lint-and-types:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Rewrite submodule SSH URL to HTTPS
+        shell: bash
+        run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - name: Check generated agent policy
+        run: |
+          python3 .agents/test_generate_claude.py
+          python3 .agents/generate-claude.py --check
+
+      # Two past incidents (a bad merge-conflict resolution, then an
+      # incomplete follow-up bump) silently walked the dimina pointer
+      # backwards in history, dropping upstream fixes for ~11 days without
+      # anyone noticing until a host bug report surfaced it. A pointer
+      # bump must always move to a descendant of the previous pin.
+      - name: Guard against dimina submodule pointer regressions
+        if: github.event_name == 'pull_request'
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin "$GITHUB_BASE_REF"
+          old_sha=$(git rev-parse "FETCH_HEAD:dimina")
+          new_sha=$(git rev-parse HEAD:dimina)
+          if [ "$old_sha" = "$new_sha" ]; then
+            echo "dimina submodule pointer unchanged ($new_sha)."
+            exit 0
+          fi
+          cd dimina
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --unshallow origin
+          else
+            git fetch origin
+          fi
+          git fetch origin "$old_sha" || true
+          if git merge-base --is-ancestor "$old_sha" "$new_sha"; then
+            echo "OK: new dimina pin ($new_sha) is a descendant of the old pin ($old_sha)."
+          else
+            echo "::error::dimina submodule pointer regressed: new pin $new_sha is NOT a descendant of old pin $old_sha. This has happened twice before and silently dropped upstream fixes. If this is an intentional revert of a bad upstream commit, say so explicitly in the PR description; otherwise re-point to a commit that descends from $old_sha."
+            exit 1
+          fi
+
+      - uses: pnpm/action-setup@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      # The compiler build reads dimina submodule sources (inputs outside its
+      # package dir, invisible to turbo's default hashing). The pointer file is
+      # a turbo globalDependency, so a submodule bump invalidates every cache.
+      - name: Record submodule revision for turbo hashing
+        run: git rev-parse HEAD:dimina > .dimina-rev
+
+      # Persist turbo's content-addressed cache across runs: unchanged
+      # packages' build/lint/check-types replay instead of re-running.
+      - name: Restore turbo cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo
+          key: turbo-${{ runner.os }}-${{ github.sha }}-lint
+          restore-keys: |
+            turbo-${{ runner.os }}-${{ github.sha }}-
+            turbo-${{ runner.os }}-
+
+      - name: Install workspace deps
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Verify Electron archive writer
+        run: pnpm --filter @dimina-studio/devtools run verify:asar-writer
+
+      - name: Test Electron locale archive checks
+        run: node --test packages/devtools/scripts/verify-electron-locales.test.js
+
+      - name: Test release artifact metadata checks
+        run: node --test packages/devtools/scripts/verify-release-artifacts.test.js
+
+      - name: Verify differential update download fallback
+        run: pnpm --filter @dimina-studio/devtools run verify:differential-download
+
+      # Compares against upstream-lockfile-snapshot.json (frozen at the pinned
+      # dimina submodule commit) instead of a live `pnpm -C dimina/fe install`:
+      # dimina/fe has no committed lockfile, so a live resolve isn't
+      # reproducible between runs — two independent installs of the identical
+      # submodule commit's package.json minutes apart resolved sass to
+      # different patch versions. The snapshot makes this deterministic and
+      # PR-blocking again, since a mismatch now only happens when this PR's
+      # own diff (a compiler dep bump, or a submodule pointer bump without a
+      # refreshed snapshot) actually caused it — see
+      # packages/compiler/scripts/snapshot-upstream-versions.js.
+      - name: Check wasm toolchain alignment with upstream
+        run: pnpm --filter @dimina-studio/compiler run check:wasm-alignment
+
+      # Catches the case that bit host devtools: devDependencies.electron
+      # got bumped in a package but
+      # peerDependencies.electron (the only version signal host applications
+      # see, since devDependencies are never installed by consumers) was left
+      # on the old major.
+      - name: Check electron peerDependencies stay in sync with devDependencies
+        run: pnpm run check:electron-peer-sync
+
+      # The install steps in this workflow all pass --ignore-scripts, so CI
+      # never hits ERR_PNPM_IGNORED_BUILDS itself — an undeclared build script
+      # would land on main and only fail on a developer's own `pnpm install`.
+      # The scan works here regardless: --ignore-scripts still extracts every
+      # package, it only skips running their scripts.
+      - name: Check allowBuilds covers every installed build script
+        run: pnpm run check:allow-builds
+
+      - name: Lint and type-check
+        run: pnpm turbo run lint check-types --cache-dir=.turbo
+
+  # gate consumes the test run's artifacts (test-report / coverage), so test
+  # and gate stay serialized within this job — everything else runs beside it.
+  test-and-pawl:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    steps:
+      - name: Rewrite submodule SSH URL to HTTPS
+        shell: bash
+        run: git config --global url."https://github.com/".insteadOf "git@github.com:"
+
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: pnpm/action-setup@v5
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version-file: .node-version
+          cache: pnpm
+
+      # Same submodule-pointer anchor as lint-and-types: a dimina bump must
+      # invalidate the turbo cache (compiler build reads submodule sources).
+      - name: Record submodule revision for turbo hashing
+        run: git rev-parse HEAD:dimina > .dimina-rev
+
+      # Persist turbo's cache: a cache-hit test task replays its recorded
+      # outputs (test-report*.json + coverage/**) — exactly the artifacts the
+      # gate step consumes, so replayed packages still feed the gate.
+      - name: Restore turbo cache
+        uses: actions/cache@v4
+        with:
+          path: .turbo
+          key: turbo-${{ runner.os }}-${{ github.sha }}-test
+          restore-keys: |
+            turbo-${{ runner.os }}-${{ github.sha }}-
+            turbo-${{ runner.os }}-
+
+      - name: Install workspace deps
+        run: pnpm install --frozen-lockfile --ignore-scripts
+
+      - name: Test
+        run: pnpm turbo run test --cache-dir=.turbo
+
+      # Compile the remaining project-specific pawl adapters and test both the
+      # adapter contracts and release-version helpers before either gate or
+      # release workflow consumes them.
+      - name: Build & test repository tooling
+        run: |
+          set -o pipefail
+          pnpm exec tsc -p tools/pawl
+          node --test ".github/scripts/*.test.js" "tools/pawl/*.test.ts"
+
+      # `npm pack` 只看磁盘上现在有什么，所以这一步得自己保证每个被检查的包都构建
+      # 过。上面的 `turbo run test` 不够：test 只依赖 `^build`，也就是只构建被别人
+      # 依赖的包。仓库里没有任何包依赖 @dimina-studio/devtools，它的 dist 于是始终是
+      # 空的，检查会把它声明的每一个入口都报成"没进 tarball"。
+      #
+      # devtools 的整包 build 在这里跑不起来：第一步 build:container 要构建
+      # dimina/fe 里的容器，而 dimina/fe 是另一个独立的 pnpm workspace，本 job 只装了
+      # 仓库根，构建会直接报 `Cannot find package '@vitejs/plugin-vue'`。所以把它从
+      # turbo 那一轮排除，单独跑 build:main 和 build:preload——devtools 声明出去的
+      # 22 个入口全部出自这两步，都不碰 dimina/fe。容器和 native-host 不在入口里，
+      # 少了它们不影响这个检查要核对的东西。
+      - name: Check publish contract
+        run: |
+          pnpm turbo run build --filter='!@dimina-studio/devtools' --cache-dir=.turbo
+          pnpm --filter @dimina-studio/devtools run build:main
+          pnpm --filter @dimina-studio/devtools run build:preload
+          node .github/scripts/check-publish-contract.js
+
+      # setup-pawl installs the binary and runs `check`; comments are disabled
+      # because this workflow grants read-only repository permissions, so a
+      # sticky PR comment would fail to upsert. The install leaves pawl on
+      # PATH, so the baseline guard below reuses it.
+      - name: Anti-regression gate
+        uses: tiangong-dev/pawl@v0.8.1
+        with:
+          version: v0.8.1
+          command: check
+          comment: 'false'
+
+      # `pawl guard` reads `Pawl-Accept:` trailers from the commits between the
+      # base and HEAD, which is how a deliberately accepted regression (a
+      # changed measurement definition, say) is authorized. actions/checkout
+      # fetches refs/pull/N/merge at depth 1, so HEAD is a grafted merge commit
+      # with no parents: the only commit in range is the merge commit GitHub
+      # generated, whose message carries no trailer, and an authorized
+      # regression is reported as unauthorized. Deepening past this PR's own
+      # commits puts them back in range.
+      - name: Anti-regression baseline guard
+        if: github.event_name == 'pull_request'
+        env:
+          PR_COMMITS: ${{ github.event.pull_request.commits }}
+          MERGE_REF: refs/pull/${{ github.event.pull_request.number }}/merge
+        run: |
+          set -euo pipefail
+          if [ "$(git rev-parse --is-shallow-repository)" = "true" ]; then
+            git fetch --deepen="$((PR_COMMITS + 1))" origin "$MERGE_REF"
+          fi
+          git fetch --depth=1 origin "$GITHUB_BASE_REF"
+          pawl guard FETCH_HEAD

@@ -1,0 +1,62 @@
+appId: com.dimina.devtools
+productName: Dimina DevTools
+artifactName: dimina-devtools-${version}-${os}-${arch}.${ext}
+# Skip electron-builder's implicit `npm rebuild` pass: the only native
+# addons in the runtime tree (esbuild, @oxc-parser bindings) ship prebuilt
+# per-platform and never need a rebuild. A preflight guard in the release
+# workflow fails the build if any other .node binary shows up unexpectedly.
+npmRebuild: false
+directories:
+  output: release
+# Override package.json "main" for the packaged app only.
+# Source main points to the library API (api.js), but Electron needs the
+# entry that actually calls launch(). Ship the single-file esbuild bundle
+# (index.bundle.js) instead of the 55 tsc-emitted subpath outputs so that
+# packaged apps load one file and hosts embedding the library via npm keep
+# the granular subpath imports they already depend on.
+extraMetadata:
+  main: dist/main/index.bundle.js
+electronLanguages:
+  - en-US
+  - zh-CN
+files:
+  - dist/**/*
+  - package.json
+  - templates/**/*
+  - '!**/*.map'
+  # The compile runtime is @dimina-studio/compiler's node bundles (loaded by
+  # @dimina-studio/devkit's forked compile worker). They keep sass / less /
+  # postcss / cssnano / autoprefixer / cheerio / @vue/compiler-sfc /
+  # oxc-parser / oxc-walker / esbuild external and require() them from
+  # node_modules at compile time, so those packages MUST ship in the app.
+  # Only the browser bundles (~25MB, consumed by web hosts via vite, never
+  # require()'d by the packaged main process) are safe to strip.
+  - '!**/node_modules/@dimina-studio/compiler/dist/*.browser.js'
+asarUnpack:
+  - '**/node_modules/esbuild/**'
+  - '**/node_modules/@esbuild/**'
+  # Native .node addons cannot load from inside asar. Only the host
+  # platform's binding is installed on the native build runner, so this
+  # unpacks exactly one binding per platform.
+  - '**/node_modules/@oxc-parser/**'
+linux:
+  target:
+    - dir
+    - AppImage
+  category: Development
+mac:
+  electronLanguages:
+    - en
+    - zh_CN
+  target:
+    - dmg
+    - zip
+  category: public.app-category.developer-tools
+win:
+  target:
+    - dir
+    - nsis
+publish:
+  provider: github
+  owner: lbb00
+  repo: dimina-studio

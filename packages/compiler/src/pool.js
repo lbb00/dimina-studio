@@ -1,0 +1,266 @@
+// Orchestrated compile pool — the "batteries-included" export. The host calls
+// createCompilerPool(...).compile(source) and gets the merged build back; the pool
+// owns ALL the orchestration the host used to hand-write:
+//   - a resident worker per stage, kept warm so the wasm toolchain loads ONCE
+//   - dmcc-consistent stage-level parallelism (logic | view | style each in a realm)
+//   - realm reuse across compiles (resetCompilerState inside the worker)
+//   - dispatch + disjoint-output merge
+//
+// Worker supervision (inactivity watchdog, immediate terminate on death, generation
+// guard against stale replies, terminate-ack-gated respawn) lives in src/worker-slot.js
+// — this file only describes how to spawn a browser Worker and what the compile
+// protocol looks like. A compile attempt killed by worker death (timeout/crash) is
+// transparently retried exactly once on a fresh worker (retryOnWorkerDeath).
+//
+// What stays with the host is only what is genuinely host-specific:
+//   - createWorker(): how to spawn a module Worker running this package's stage worker
+//     (bundler/hosting-specific — one line)
+//   - toolchainSetupURL: an ESM the worker imports to install the two wasm hooks
+//     (esbuild.wasm / oxc wasm are host-hosted assets)
+//   - the source itself (a { relPath: content } map). OPFS is intentionally NOT here:
+//     it's an optional zero-copy source-distribution the host can layer on.
+import { COMPILER_ERROR_CODES, WORKER_DEATH_CODES, isCompilerErrorCode } from './error-codes.js'
+import { createWorkerSlot, settleAll } from './worker-slot.js'
+
+export { COMPILER_ERROR_CODES, INFRASTRUCTURE_ERROR_CODES, isInfrastructureError } from './error-codes.js'
+
+const DEFAULT_STAGES = ['logic', 'view', 'style']
+
+// Default INACTIVITY ceiling for a setup/compile-subset round trip. The stage worker
+// heartbeats while it works, so any sign of life resets this window — it only expires
+// after that much total silence, which for a live worker means it is truly wedged
+// (e.g. a synchronous wasm loop blocking its event loop). Without it, a stuck worker
+// would leave compile() (and the host fallback keyed off its rejection) pending
+// forever.
+const DEFAULT_SEND_TIMEOUT_MS = 30000
+
+// Warmup gets its own, longer window: a cold wasm-toolchain fetch (~13MB) can
+// legitimately dwarf a compile step, but a hung toolchain import must STILL reject
+// eventually — an unguarded warmup would wedge the serial compile chain forever.
+const DEFAULT_WARMUP_TIMEOUT_MS = 120000
+
+/**
+ * @param {{
+ *   createWorker: () => Worker,     // required: spawn a module worker running dist/stage-worker.browser.js
+ *   toolchainSetupURL: string,      // required: ESM URL that installs __esbuildTransform/__oxcParseSync in the worker
+ *   stages?: string[],              // default ['logic','view','style']
+ *   workPath?: string,              // default '/work'
+ *   onLog?: (entry: { level: 'log'|'warn'|'error', message: string, stage: string }) => void,  // worker console diagnostics, tagged with the stage worker that emitted them; level is whichever console.* the compiler called (stage-worker.js patches exactly these three)
+ *   sendTimeoutMs?: number,         // default 30000 — inactivity window per setup/compile-subset round trip
+ *   warmupTimeoutMs?: number,       // default 120000 — inactivity window for the warmup round trip
+ *   retryOnWorkerDeath?: boolean,   // default true — one transparent whole-attempt retry after a worker death
+ * }} options
+ */
+// options 没有默认值是有意的：createWorker 和 toolchainSetupURL 都必填，参数整体
+// 也就必填，生成的 .d.ts 才不会让 TypeScript 调用方写出能过类型检查、一运行就抛的
+// createCompilerPool()。函数体里的 `|| {}` 只是让那种调用仍然拿到下面这句人话报错。
+export function createCompilerPool(options) {
+  const {
+    createWorker,
+    toolchainSetupURL,
+    stages = DEFAULT_STAGES,
+    workPath: defaultWorkPath = '/work',
+    onLog,
+    sendTimeoutMs = DEFAULT_SEND_TIMEOUT_MS,
+    warmupTimeoutMs = DEFAULT_WARMUP_TIMEOUT_MS,
+    retryOnWorkerDeath = true,
+  } = options || {}
+  if (typeof createWorker !== 'function') {
+    throw new Error('[compiler] createCompilerPool: options.createWorker (() => Worker) is required')
+  }
+  if (!toolchainSetupURL) {
+    throw new Error('[compiler] createCompilerPool: options.toolchainSetupURL is required')
+  }
+
+  let disposed = false
+
+  const workers = stages.map((stage) => {
+    const name = `[compiler] stage '${stage}' worker`
+    const slot = createWorkerSlot({
+      name,
+      spawnTransport: ({ onMessage, onCrash }) => {
+        const w = createWorker()
+        w.onmessage = (e) => onMessage(e.data)
+        w.onerror = (ev) => {
+          // Worker-script-level failure (module load / uncaught). ErrorEvent.message is
+          // often empty for these — surface filename:lineno and a hint so it's not a
+          // bare "error".
+          const msg = (ev && (ev.message || (ev.error && ev.error.message)))
+            || 'worker failed to load or threw (no message — often a module-load / static-asset / cross-origin failure)'
+          const where = ev && ev.filename ? ` (${ev.filename}:${ev.lineno || 0})` : ''
+          onCrash(`${name} error: ${msg}${where}`)
+        }
+        w.onmessageerror = () => {
+          onCrash(`${name} sent an unstructured-clonable message (onmessageerror)`)
+        }
+        return { postMessage: (m) => w.postMessage(m), terminate: () => w.terminate() }
+      },
+      onEvent: (d) => {
+        // Diagnostics the compiler logs inside the worker (missing components,
+        // unsupported wx APIs, style-preprocessor fallbacks, …) arrive as out-of-band
+        // { type:'log' } messages — surface them via onLog instead of pairing them
+        // with a request reply.
+        if (d && d.type === 'log') {
+          if (onLog) { try { onLog({ level: d.level, message: d.message, stage }) } catch { /* ignore */ } }
+          return true
+        }
+        // Heartbeats exist purely as liveness for the slot's inactivity watchdog.
+        if (d && d.type === 'heartbeat') return true
+        return false
+      },
+    })
+    const entry = { stage, slot, warmed: null, warmedGen: 0 }
+    // Spawn eagerly so the pool is warm from creation; a spawn failure surfaces on the
+    // first compile()'s own ensureAlive rather than as an unhandled rejection here.
+    slot.ensureAlive().catch(() => {})
+    return entry
+  })
+
+  // Sends a protocol message and normalizes the worker's own { type:'error' } replies
+  // (real compile errors — message + stack from inside the worker) into throws. Worker
+  // DEATH (timeout/crash) instead arrives as a coded rejection from the slot.
+  async function requestChecked(entry, msg, description, timeoutMs) {
+    const r = await entry.slot.request(msg, { timeoutMs, description })
+    if (!r || r.type === 'error') {
+      // Stable classification for host: worker-reported compile/setup errors get
+      // their own code, distinct from the worker-death codes that gate the retry.
+      // A worker that classified its own failure (toolchain setup, which is machinery
+      // rather than the user's project) sends its code along — keep it, since only the
+      // worker can tell those apart, but only if it is one of the published codes. A
+      // runtime code that happens to ride along on the reply (a memfs `ENOENT`) is not
+      // something a host can branch on, so it lands in the compile-error bucket.
+      const workerCode = r && isCompilerErrorCode(r.code) ? r.code : null
+      const error = Object.assign(
+        new Error(r && r.error ? r.error : `[compiler] ${description} failed in stage '${entry.stage}' worker`),
+        { code: workerCode || COMPILER_ERROR_CODES.stageError, stage: entry.stage },
+      )
+      if (Array.isArray(r && r.diagnostics)) error.diagnostics = r.diagnostics
+      throw error
+    }
+    return r
+  }
+
+  // (Re)warms one stage: respawns after a death (ensureAlive awaits the dead worker's
+  // terminate() settlement first), then memoizes the warmup round trip per generation —
+  // a live warm slot just awaits an already-resolved promise here.
+  async function ensureWarm(entry) {
+    const { slot } = entry
+    await slot.ensureAlive()
+    if (!entry.warmed || entry.warmedGen !== slot.generation) {
+      entry.warmedGen = slot.generation
+      // stages tells the worker which stage it owns; it reports that identity back in
+      // logs and errors. Every stage loads the toolchain (style minifies through
+      // esbuild too), so this is no longer what decides whether the import happens.
+      entry.warmed = requestChecked(
+        entry,
+        { type: 'warmup', toolchainSetupURL, stages: [entry.stage], wantHeartbeat: true },
+        'warmup',
+        warmupTimeoutMs,
+      ).then(() => {}).catch((err) => {
+        if (entry.warmedGen === slot.generation) entry.warmed = null
+        throw err
+      })
+      entry.warmed.catch(() => {}) // observed even when an attempt aborts early on a sibling's failure
+    }
+    return entry.warmed
+  }
+
+  // 返回值刻意丢掉：settleAll 的数组是内部记账，暴露出去调用方会以为那是每个 stage
+  // 的结果。await 之后什么都拿不到，正好对应 README 里写的 Promise<void>。
+  async function warmup() {
+    await settleAll(workers.map(ensureWarm))
+  }
+
+  // One full compile attempt against the resident realms. Ends quiescent: settleAll
+  // guarantees no request is still in flight when it returns/throws, so a retry can
+  // start fresh without cross-attempt FIFO pairing.
+  async function runAttempt(files, workPath, options) {
+    await settleAll(workers.map(ensureWarm))
+
+    // Setup step — one worker runs setup ONCE: it parses config, builds
+    // miniprogram_npm + app-config.json (the npm build can invoke the wasm toolchain)
+    // and produces the scaffold. The resulting { pages, storeInfo } bundle is
+    // broadcast to every stage so this heavy work runs once instead of per stage.
+    // Scope ids are a deterministic hash(path) (dimina utils.js), so each stage would
+    // derive identical `data-v-<id>` even from its own setup — the broadcast is a
+    // de-dup optimization, NOT a scope-correctness requirement (scripts/test-pool-scopehash.js
+    // asserts per-stage independent setup stays scope-consistent). Mirrors the Node
+    // disk pool, which likewise sets up once and fans the same { pages, storeInfo } out.
+    // `options` (e.g. { fileTypes }) only needs to reach THIS setup call: dmcc's
+    // storeInfo() bakes the normalized dialect into the returned storeInfo object
+    // (dimina/fe/packages/compiler/src/env.js:106-120), which rides inside `bundle`
+    // below and is restored per-stage via resetStoreInfo (compile-core.js's
+    // compileStage -> env.js:122-132) — so compile-subset never needs its own copy.
+    const s = await requestChecked(workers[0], { type: 'setup', files, workPath, options, wantHeartbeat: true }, 'setup', sendTimeoutMs)
+    const { bundle, scaffold } = s
+
+    // Compile step — every stage compiles in parallel against the SHARED bundle. The
+    // non-stage scaffold (app-config.json + npm, produced once) seeds the union.
+    const parts = await settleAll(workers.map((x) =>
+      requestChecked(x, { type: 'compile-subset', files, workPath, stages: [x.stage], bundle, wantHeartbeat: true }, 'compile-subset', sendTimeoutMs)))
+    const merged = { ...(scaffold || {}) }
+    const diagnostics = []
+    for (const pr of parts) {
+      Object.assign(merged, pr.result.files) // stages write disjoint files -> clean union
+      diagnostics.push(...(pr.result.diagnostics ?? []))
+    }
+    return { appId: bundle.appId, name: bundle.name, files: merged, diagnostics }
+  }
+
+  // Compiles share the resident realms, so they must not overlap — serialize them.
+  let chain = Promise.resolve()
+
+  /**
+   * Single argument, no ambiguity: pass { files, workPath, options }. A bare
+   * { relPath: content } map is also accepted (uses the default workPath, no options).
+   * @param {{
+   *   files: Record<string, string | Uint8Array>,
+   *   workPath?: string,
+   *   options?: { fileTypes?: { template?: readonly string[], style?: readonly string[], viewScript?: readonly string[] } },
+   * } | Record<string, string | Uint8Array>} input
+   *   Source files are text or raw bytes: an image belongs in the map as a Uint8Array,
+   *   not as a decoded string (postMessage carries it as bytes, and the stage worker
+   *   seeds it into its memfs as a file).
+   *   options.fileTypes lets a caller register a custom template/style/view-script
+   *   dialect (e.g. { template: ['altml'], style: ['altss'], viewScript: ['alts'] }) —
+   *   forwarded to the setup worker's `setupCompile` (dmcc's storeInfo).
+   * @returns {Promise<{ appId: string, name: string, files: Record<string, string | Uint8Array>, diagnostics: Array<{ source: string, line: number, column: number, endLine: number, endColumn: number, message: string, severity: 'warning'|'error' }> }>}
+   *   Compiled products: UTF-8 text as strings, binary assets (images copied into
+   *   `main/static`) as raw bytes.
+   */
+  function compile(input = {}) {
+    const run = chain.then(async () => {
+      if (disposed) {
+        throw Object.assign(new Error('[compiler] pool has been disposed'), { code: COMPILER_ERROR_CODES.poolDisposed })
+      }
+      const files = input.files || input
+      if (!files || typeof files !== 'object' || !Object.keys(files).length) {
+        throw Object.assign(
+          new Error('[compiler] pool.compile expects { files: { relPath: content }, workPath?, options? } (or a non-empty files map)'),
+          { code: COMPILER_ERROR_CODES.invalidInput },
+        )
+      }
+      const workPath = input.workPath || defaultWorkPath
+      const options = input.options || {}
+      try {
+        return await runAttempt(files, workPath, options)
+      } catch (err) {
+        // A worker death is often transient (memory pressure, tab freeze, a one-off
+        // toolchain stall) — retry the WHOLE attempt once on fresh workers. Real
+        // compile errors (bad user source) are deterministic and are never retried.
+        if (!retryOnWorkerDeath || !err || !WORKER_DEATH_CODES.has(err.code)) throw err
+        return await runAttempt(files, workPath, options)
+      }
+    })
+    // keep the chain alive regardless of this compile's outcome
+    chain = run.then(() => {}, () => {})
+    return run
+  }
+
+  async function dispose() {
+    disposed = true
+    await Promise.all(workers.map((x) => x.slot.dispose()))
+  }
+
+  return { warmup, compile, dispose, stages: [...stages] }
+}

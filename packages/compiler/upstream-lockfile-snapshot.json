@@ -1,0 +1,24 @@
+{
+  "diminaCommit": "fa34f11e02f480df715d374e11a3f531f63b7a60",
+  "versions": {
+    "@vue/compiler-sfc": "3.5.43",
+    "autoprefixer": "10.6.1",
+    "cheerio": "1.2.0",
+    "cssnano": "9.0.5",
+    "esbuild": "0.28.2",
+    "htmlparser2": "12.0.0",
+    "less": "4.9.1",
+    "magic-string": "1.4.2",
+    "oxc-parser": "0.150.0",
+    "oxc-walker": "1.1.1",
+    "postcss": "8.5.28",
+    "postcss-selector-parser": "7.1.6",
+    "sass": "1.105.0",
+    "source-map-js": "1.2.1"
+  },
+  "transitiveVersions": {
+    "autoprefixer>browserslist": "4.28.9",
+    "autoprefixer>caniuse-lite": "1.0.30001810",
+    "autoprefixer>browserslist>caniuse-lite": "1.0.30001810"
+  }
+}

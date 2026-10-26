@@ -1,0 +1,1507 @@
+import { EventEmitter } from 'node:events'
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
+import { createConnectionRegistry } from 'electron-deck/main'
+import {
+  buildElementsHookScript,
+  installElementsForward,
+  isRenderEventMethod,
+  NETWORK_BODY_METHODS,
+  RENDER_DOMAIN_PREFIXES,
+  routeByDomain,
+  routeOutboundCommand,
+} from './index.js'
+import { VIRTUAL_REQUEST_ID_PREFIX } from '../network-forward/index.js'
+
+// ── electron mock ──────────────────────────────────────────────────────────────
+// The feature lazily `require('electron').webContents.fromId(id)` in
+// detachSelfAttached. Back it with a registry the fakes populate so a self-
+// attached guest can be resolved (and detached) on dispose.
+const wcRegistry = new Map<number, unknown>()
+vi.mock('electron', () => ({
+  webContents: {
+    fromId: (id: number) => wcRegistry.get(id) ?? null,
+  },
+}))
+
+beforeEach(() => {
+  wcRegistry.clear()
+})
+
+// ── routing table ───────────────────────────────────────────────────────────────
+
+describe('routeByDomain (routing table)', () => {
+  it('routes the Elements-tree domains to the render guest', () => {
+    for (const method of [
+      'DOM.getDocument',
+      'DOM.requestChildNodes',
+      'CSS.getMatchedStylesForNode',
+      'CSS.getComputedStyleForNode',
+      'Overlay.highlightNode',
+      'Overlay.setInspectMode',
+      'DOMSnapshot.captureSnapshot',
+      'DOMDebugger.getEventListeners',
+    ]) {
+      expect(routeByDomain(method)).toBe('render')
+    }
+  })
+
+  it('routes Overlay.disable and Overlay.highlightNode to the render guest', () => {
+    // The Elements highlight + its teardown both act on the render guest's
+    // Overlay domain; both must reach the render debugger, never the service host.
+    expect(routeByDomain('Overlay.highlightNode')).toBe('render')
+    expect(routeByDomain('Overlay.disable')).toBe('render')
+    expect(routeByDomain('Overlay.enable')).toBe('render')
+  })
+
+  it('RED LINE: Emulation.* stays on the SERVICE host (never render)', () => {
+    expect(routeByDomain('Emulation.setSafeAreaInsetsOverride')).toBe('service')
+    expect(routeByDomain('Emulation.setDeviceMetricsOverride')).toBe('service')
+    expect(routeByDomain('Emulation.clearDeviceMetricsOverride')).toBe('service')
+  })
+
+  it('keeps every service-owned domain on the service path', () => {
+    for (const method of [
+      'Runtime.evaluate',
+      'Console.enable',
+      'Debugger.enable',
+      'Network.enable',
+      'Page.navigate',
+      'Target.attachToTarget',
+      'Input.dispatchKeyEvent',
+      'Profiler.start',
+      'Log.enable',
+    ]) {
+      expect(routeByDomain(method)).toBe('service')
+    }
+  })
+
+  it('anchors the prefix at the start (no mid-string mis-route)', () => {
+    expect(routeByDomain('Page.setDOMCounter')).toBe('service')
+    expect(routeByDomain('Runtime.evaluateDOM')).toBe('service')
+  })
+
+  it('isRenderEventMethod agrees with the render route', () => {
+    expect(isRenderEventMethod('DOM.setChildNodes')).toBe(true)
+    expect(isRenderEventMethod('Overlay.nodeHighlightRequested')).toBe(true)
+    expect(isRenderEventMethod('Runtime.consoleAPICalled')).toBe(false)
+  })
+})
+
+describe('buildElementsHookScript', () => {
+  it('is an idempotent IIFE guarding on the install sentinel', () => {
+    const src = buildElementsHookScript()
+    expect(src.startsWith('(function(){')).toBe(true)
+    expect(src).toContain('__diminaElementsHookInstalled')
+    expect(src).toContain("return 'already'")
+    expect(src).toContain("return 'partial'")
+  })
+
+  it('wraps sendMessageToBackend and pushes render commands to the outbound queue', () => {
+    const src = buildElementsHookScript()
+    expect(src).toContain('InspectorFrontendHost')
+    expect(src).toContain('sendMessageToBackend')
+    expect(src).toContain('__diminaElementsOutbound')
+    expect(src).toContain('OUT.push')
+    expect(src).toContain('DOM.')
+    expect(src).toContain('CSS.')
+    expect(src).toContain('Overlay.')
+  })
+})
+
+// ── fakes ───────────────────────────────────────────────────────────────────────
+
+// The reconcile script (buildReconcileScript) both (re)installs the hook AND
+// drains the outbound queue in ONE round-trip, returning `{ status, batch }`; it
+// is the only executeJavaScript payload that references `splice`. A fake devtools
+// wc answers it via `reconcileResponder`: `status` is 'installed' the first tick
+// (models a freshly (re)wrapped front-end → the feature re-primes + re-pulls) and
+// 'already' after; `batch` is the queued commands, drained once. Every other
+// payload (dispatchMessage / documentUpdated) resolves to a benign value.
+function isReconcile(src: unknown): src is string {
+  return typeof src === 'string' && src.includes('splice')
+}
+function reconcileResponder(batch: unknown[] = []): (src: string) => Promise<unknown> {
+  let installed = false
+  let drained = false
+  return (src: string) => {
+    if (isReconcile(src)) {
+      const status = installed ? 'already' : ((installed = true), 'installed')
+      const b = drained ? [] : ((drained = true), batch)
+      return Promise.resolve({ status, batch: b })
+    }
+    return Promise.resolve(true)
+  }
+}
+
+function fakeDebugger(opts: {
+  attached?: boolean
+  sendCommand?: (method: string, params?: object) => Promise<unknown>
+} = {}) {
+  const messageHandlers: Array<(e: unknown, method: string, params: unknown) => void> = []
+  let attached = opts.attached ?? true
+  return {
+    isAttached: vi.fn(() => attached),
+    attach: vi.fn((_protocol: string) => { attached = true }),
+    detach: vi.fn(() => { attached = false }),
+    sendCommand: vi.fn(opts.sendCommand ?? (() => Promise.resolve({}))),
+    on: vi.fn((event: string, cb: (e: unknown, method: string, params: unknown) => void) => {
+      if (event === 'message') messageHandlers.push(cb)
+    }),
+    removeListener: vi.fn(),
+    __emit(method: string, params: unknown) {
+      for (const h of messageHandlers) h({}, method, params)
+    },
+  }
+}
+
+let nextWcId = 1
+function fakeWc(overrides: Partial<Record<string, unknown>> = {}) {
+  const handlers: Record<string, () => void> = {}
+  const dbg = (overrides.debugger as ReturnType<typeof fakeDebugger>) ?? fakeDebugger()
+  const wc = {
+    id: (overrides.id as number) ?? nextWcId++,
+    debugger: dbg,
+    isDestroyed: vi.fn(() => false),
+    isLoading: vi.fn(() => false),
+    executeJavaScript: vi.fn(reconcileResponder()),
+    getURL: vi.fn(() => 'pageFrame.html?pagePath=pages/home/home'),
+    once: vi.fn((event: string, cb: () => void) => { handlers[event] = cb }),
+    // Real WebContents exposes `on` (persistent) alongside `once`; elements-forward
+    // now uses `on('dom-ready', …)` to re-install the hook on every front-end load.
+    // Stash under the same `__handlers` map so a test can re-fire `dom-ready`.
+    on: vi.fn((event: string, cb: () => void) => { handlers[event] = cb }),
+    removeListener: vi.fn(),
+    __handlers: handlers,
+    ...overrides,
+  }
+  wcRegistry.set(wc.id, wc)
+  return wc
+}
+
+// A render guest backed by a REAL EventEmitter so the connection registry's
+// `wc.once('destroyed', …)` actually fires when we `emit('destroyed')`. Mirrors
+// `fakeWc` otherwise (debugger, isDestroyed, etc.) and registers in wcRegistry so
+// detachSelfAttached can resolve it by id.
+function emitterWc(overrides: Partial<Record<string, unknown>> = {}) {
+  const emitter = new EventEmitter()
+  const dbg = (overrides.debugger as ReturnType<typeof fakeDebugger>) ?? fakeDebugger()
+  let destroyed = false
+  const wc = {
+    id: (overrides.id as number) ?? nextWcId++,
+    debugger: dbg,
+    isDestroyed: vi.fn(() => destroyed),
+    isLoading: vi.fn(() => false),
+    executeJavaScript: vi.fn(reconcileResponder()),
+    getURL: vi.fn(() => 'pageFrame.html?pagePath=pages/home/home'),
+    once: (event: string, cb: () => void) => { emitter.once(event, cb); return wc },
+    on: (event: string, cb: () => void) => { emitter.on(event, cb); return wc },
+    removeListener: (event: string, cb: () => void) => { emitter.removeListener(event, cb); return wc },
+    emit: (event: string) => emitter.emit(event),
+    __destroy() { destroyed = true; emitter.emit('destroyed') },
+    ...overrides,
+  }
+  wcRegistry.set(wc.id, wc)
+  return wc
+}
+
+function fakeBridge(getActiveRenderWc: () => unknown) {
+  const listeners = new Set<(e: unknown) => void>()
+  return {
+    getActiveRenderWc: vi.fn(getActiveRenderWc),
+    onRenderEvent: vi.fn((cb: (e: unknown) => void) => {
+      listeners.add(cb)
+      return () => listeners.delete(cb)
+    }),
+    __emit(event: unknown) { for (const l of listeners) l(event) },
+  }
+}
+
+// A bridge whose active render guest can be repointed between page switches.
+// `setActive(wc)` flips the pointer; emit an `activePage` event to make the
+// feature follow it. Models switchTab/navigateBack returning to an EXISTING,
+// still-alive guest wc (render guests are reused, not destroyed, on tab swap).
+function fakeSwitchableBridge(initial: unknown) {
+  let active = initial
+  const base = fakeBridge(() => active)
+  return Object.assign(base, {
+    setActive(wc: unknown) { active = wc },
+  })
+}
+
+// A devtools host wc that drains a single outbound batch on the first reconcile
+// tick, then nothing. The reconcile script also re-asserts the hook, so its reply
+// carries both `status` and `batch` (see `reconcileResponder`).
+function devtoolsWcDrainingOnce(batch: unknown[]) {
+  return fakeWc({ executeJavaScript: vi.fn(reconcileResponder(batch)) })
+}
+
+function dispatchedMatching(devtoolsWc: ReturnType<typeof fakeWc>, needle: string): string[] {
+  return (devtoolsWc.executeJavaScript as ReturnType<typeof vi.fn>).mock.calls
+    .map((c) => c[0] as string)
+    .filter((s) => s.includes('dispatchMessage') && s.includes(needle))
+}
+
+// ── routing + id/sessionId passthrough ─────────────────────────────────────────
+
+describe('installElementsForward — routing & passthrough', () => {
+  it('forwards a render command to the active guest and dispatches the result back', async () => {
+    vi.useFakeTimers()
+    try {
+      const guestDbg = fakeDebugger({
+        sendCommand: vi.fn((method: string) =>
+          method === 'DOM.getDocument'
+            ? Promise.resolve({ root: { nodeId: 1 } })
+            : Promise.resolve({})),
+      })
+      const guest = fakeWc({ debugger: guestDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 7, method: 'DOM.getDocument', params: {}, sessionId: null },
+      ])
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      expect(guestDbg.sendCommand).toHaveBeenCalledWith('DOM.getDocument', {})
+      const dispatched = dispatchedMatching(devtoolsWc, '\\"id\\":7')
+      expect(dispatched.length).toBeGreaterThan(0)
+      expect(dispatched.some((s) => s.includes('result'))).toBe(true)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('passes the front-end id + sessionId straight through (no mapping)', async () => {
+    vi.useFakeTimers()
+    try {
+      const guest = fakeWc()
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 42, method: 'DOM.getDocument', params: {}, sessionId: 'SESS-XYZ' },
+      ])
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      const dispatched = dispatchedMatching(devtoolsWc, '\\"id\\":42')
+      expect(dispatched.length).toBeGreaterThan(0)
+      // The original sessionId is echoed back verbatim.
+      expect(dispatched.some((s) => s.includes('SESS-XYZ'))).toBe(true)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('replies with a CDP error when there is no active render guest', async () => {
+    vi.useFakeTimers()
+    try {
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 9, method: 'DOM.getDocument', params: {}, sessionId: 'S1' },
+      ])
+      const bridge = fakeBridge(() => null)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      const errs = dispatchedMatching(devtoolsWc, '\\"id\\":9')
+      expect(errs.length).toBeGreaterThan(0)
+      expect(errs.some((s) => s.includes('no active render guest') && s.includes('-32000'))).toBe(true)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('settles with an error when the guest is destroyed mid-sendCommand (no pending leak)', async () => {
+    vi.useFakeTimers()
+    try {
+      const guestDbg = fakeDebugger({
+        sendCommand: vi.fn(() => Promise.reject(new Error('Target closed'))),
+      })
+      const guest = fakeWc({ debugger: guestDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 11, method: 'DOM.getDocument', params: {}, sessionId: null },
+      ])
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      const errs = dispatchedMatching(devtoolsWc, '\\"id\\":11')
+      expect(errs.some((s) => s.includes('Target closed') && s.includes('-32000'))).toBe(true)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ── generation isolation ──────────────────────────────────────────────────────
+
+describe('installElementsForward — generation isolation', () => {
+  // A no-op activePage to the SAME guest must NOT invalidate its own in-flight
+  // command. A command errors only when the active guest ACTUALLY changes to a
+  // DIFFERENT guest while it was in flight. We switch to a separate `other` guest
+  // to express that.
+  it('drops a late response after the active guest switched to a DIFFERENT guest', async () => {
+    vi.useFakeTimers()
+    try {
+      let resolveDoc!: (v: unknown) => void
+      const guestDbg = fakeDebugger({
+        sendCommand: vi.fn((method: string) => {
+          if (method === 'DOM.getDocument') {
+            return new Promise((res) => { resolveDoc = res })
+          }
+          return Promise.resolve({})
+        }),
+      })
+      const guest = fakeWc({ debugger: guestDbg })
+      const other = fakeWc({ debugger: fakeDebugger() })
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 5, method: 'DOM.getDocument', params: {}, sessionId: null },
+      ])
+      const bridge = fakeSwitchableBridge(guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+      // Command is in flight on `guest`. Active page switches to a DIFFERENT guest.
+      bridge.setActive(other)
+      bridge.__emit({ kind: 'activePage', appId: 'a', bridgeId: 'b' })
+      // The now-stale command finally resolves.
+      resolveDoc({ root: { nodeId: 99 } })
+      await vi.advanceTimersByTimeAsync(10)
+
+      const forId5 = dispatchedMatching(devtoolsWc, '\\"id\\":5')
+      expect(forId5.length).toBeGreaterThan(0)
+      // Settled as an error (its guest is no longer active), never as a result.
+      expect(forId5.some((s) => s.includes('stale render generation'))).toBe(true)
+      expect(forId5.some((s) => s.includes('result') && s.includes('99'))).toBe(false)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // A guest that is NO LONGER active (we switched to a DIFFERENT guest) must not
+  // leak its events into the now-current tree. We make that explicit by switching
+  // to a separate `other` guest before the stale emit. (The "switch back to an old
+  // guest restores its events" contract lives in its own dedicated test below.)
+  it('drops a render EVENT from a guest that is no longer the active one', async () => {
+    vi.useFakeTimers()
+    try {
+      const guestDbg = fakeDebugger({ attached: true })
+      const guest = fakeWc({ debugger: guestDbg })
+      const otherDbg = fakeDebugger({ attached: true })
+      const other = fakeWc({ debugger: otherDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 1, method: 'DOM.enable', params: {}, sessionId: null },
+      ])
+      const bridge = fakeSwitchableBridge(guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      // Event from the active guest is forwarded.
+      guestDbg.__emit('DOM.setChildNodes', { tag: 'fresh' })
+      await vi.advanceTimersByTimeAsync(5)
+      expect(dispatchedMatching(devtoolsWc, 'fresh').length).toBeGreaterThan(0)
+
+      // Switch to a DIFFERENT guest. The old `guest` is no longer active; any
+      // event it now emits belongs to a tree the front-end has moved off and must
+      // be dropped (must not bleed into `other`'s current tree).
+      bridge.setActive(other)
+      bridge.__emit({ kind: 'activePage', appId: 'a', bridgeId: 'b' })
+      guestDbg.__emit('DOM.setChildNodes', { tag: 'stale' })
+      await vi.advanceTimersByTimeAsync(5)
+      expect(dispatchedMatching(devtoolsWc, 'stale').length).toBe(0)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // ── re-activating an existing (reused) render guest restores its events ──
+  // Render guests are NOT destroyed on switchTab/navigateBack — the target guest
+  // is an existing, alive, REUSED wc. When we switch A→B→A and land back on the
+  // already-wired guest A, A's DOM-domain events must be re-injected into the
+  // front-end again. A scheme that snapshots a generation at first wire and
+  // early-returns on re-prime would leave A's listener with a stale generation and
+  // drop its events forever after the round-trip.
+  it('B2: restores event forwarding when switching back to a previously-wired guest', async () => {
+    vi.useFakeTimers()
+    try {
+      const aDbg = fakeDebugger({ attached: true })
+      const guestA = fakeWc({ debugger: aDbg })
+      const bDbg = fakeDebugger({ attached: true })
+      const guestB = fakeWc({ debugger: bDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([])
+      const bridge = fakeSwitchableBridge(guestA)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      // 1. Initial active guest is A (wired on install).
+      await vi.advanceTimersByTimeAsync(400)
+
+      // A's events forward while it is active.
+      aDbg.__emit('DOM.setChildNodes', { tag: 'A-first' })
+      await vi.advanceTimersByTimeAsync(5)
+      expect(dispatchedMatching(devtoolsWc, 'A-first').length).toBeGreaterThan(0)
+
+      // 2. Switch to guest B.
+      bridge.setActive(guestB)
+      bridge.__emit({ kind: 'activePage', appId: 'a', bridgeId: 'b' })
+      await vi.advanceTimersByTimeAsync(5)
+
+      // 3. Switch BACK to the existing, reused guest A (navigateBack / switchTab).
+      bridge.setActive(guestA)
+      bridge.__emit({ kind: 'activePage', appId: 'a', bridgeId: 'b' })
+      await vi.advanceTimersByTimeAsync(5)
+
+      // 4. Guest A (now active again) emits a render-domain event.
+      aDbg.__emit('DOM.setChildNodes', { tag: 'A-restored' })
+      await vi.advanceTimersByTimeAsync(5)
+
+      // 5. CONTRACT: A's event must be re-injected into the front-end. It is the
+      // active tree again — dropping it because A's first-wire generation is now
+      // stale is the defect this guards against.
+      expect(dispatchedMatching(devtoolsWc, 'A-restored').length).toBeGreaterThan(0)
+
+      // Positive control (no over-correction): while A is active, B is NOT — a
+      // stray event from the now-inactive B must still be dropped, so the fix
+      // can't simply be "stop filtering entirely".
+      bDbg.__emit('DOM.setChildNodes', { tag: 'B-leak' })
+      await vi.advanceTimersByTimeAsync(5)
+      expect(dispatchedMatching(devtoolsWc, 'B-leak').length).toBe(0)
+
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // Destroying a non-active OLD guest must not error the ACTIVE guest's in-flight
+  // routed command. `onDestroyed` bumps the global generation; a too-coarse
+  // generation scheme would then settle the current guest's pending response as
+  // 'stale render generation'. The active guest's command must still resolve with
+  // its real result.
+  it('MINOR-3: destroying an old non-active guest does not stale the active guest command', async () => {
+    vi.useFakeTimers()
+    try {
+      // The OLD guest A (will be destroyed mid-flight, while inactive).
+      const aDbg = fakeDebugger({ attached: true })
+      const guestA = fakeWc({ debugger: aDbg })
+
+      // The ACTIVE guest B, whose DOM.getDocument is slow / in flight.
+      let resolveDoc!: (v: unknown) => void
+      const bDbg = fakeDebugger({
+        sendCommand: vi.fn((method: string) => {
+          if (method === 'DOM.getDocument') return new Promise((res) => { resolveDoc = res })
+          return Promise.resolve({})
+        }),
+      })
+      const guestB = fakeWc({ debugger: bDbg })
+
+      // Drain B's DOM.getDocument only on the SECOND reconcile tick (after we've
+      // switched to B), so the command is routed at B (the active guest).
+      let calls = 0
+      const devtoolsWc = fakeWc({
+        executeJavaScript: vi.fn((src: string) => {
+          if (isReconcile(src)) {
+            calls++
+            const batch = calls === 2 ? [{ id: 8, method: 'DOM.getDocument', params: {}, sessionId: null }] : []
+            return Promise.resolve({ status: calls === 1 ? 'installed' : 'already', batch })
+          }
+          return Promise.resolve(true)
+        }),
+      })
+      const bridge = fakeSwitchableBridge(guestA)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      // Active guest starts as A (wired), then we move to B.
+      await vi.advanceTimersByTimeAsync(200)
+      bridge.setActive(guestB)
+      bridge.__emit({ kind: 'activePage', appId: 'a', bridgeId: 'b' })
+
+      // Let the second drain route DOM.getDocument at B → it is now in flight.
+      await vi.advanceTimersByTimeAsync(400)
+      expect(bDbg.sendCommand).toHaveBeenCalledWith('DOM.getDocument', {})
+
+      // The OLD, now-inactive guest A is destroyed while B's command is pending.
+      guestA.__handlers.destroyed?.()
+      await vi.advanceTimersByTimeAsync(5)
+
+      // B's command finally resolves — it is the ACTIVE guest and must get its
+      // real result, NOT be settled as 'stale render generation'.
+      resolveDoc({ root: { nodeId: 77 } })
+      await vi.advanceTimersByTimeAsync(10)
+
+      const forId8 = dispatchedMatching(devtoolsWc, '\\"id\\":8')
+      expect(forId8.length).toBeGreaterThan(0)
+      expect(forId8.some((s) => s.includes('result') && s.includes('77'))).toBe(true)
+      expect(forId8.some((s) => s.includes('stale render generation'))).toBe(false)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ── self-attach tracking ──────────────────────────────────────────────────────
+
+describe('installElementsForward — self-attach tracking', () => {
+  it('REUSES an already-attached guest debugger: never attach, never detach', async () => {
+    vi.useFakeTimers()
+    try {
+      const guestDbg = fakeDebugger({ attached: true })
+      const guest = fakeWc({ debugger: guestDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 1, method: 'DOM.getDocument', params: {}, sessionId: null },
+      ])
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      expect(guestDbg.attach).not.toHaveBeenCalled()
+      stop()
+      // stop() must NOT detach a session safe-area owns.
+      expect(guestDbg.detach).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('attaches ONLY when nobody has, and on dispose detaches ONLY its own', async () => {
+    vi.useFakeTimers()
+    try {
+      const guestDbg = fakeDebugger({ attached: false })
+      const guest = fakeWc({ debugger: guestDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 2, method: 'DOM.getDocument', params: {}, sessionId: null },
+      ])
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      expect(guestDbg.attach).toHaveBeenCalledWith('1.3')
+      stop()
+      // We own this session → dispose detaches it (the wc is still attached).
+      expect(guestDbg.detach).toHaveBeenCalledTimes(1)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('does NOT detach a self-attached session whose guest was already destroyed', async () => {
+    vi.useFakeTimers()
+    try {
+      const guestDbg = fakeDebugger({ attached: false })
+      const guest = fakeWc({ debugger: guestDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 3, method: 'DOM.getDocument', params: {}, sessionId: null },
+      ])
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+      expect(guestDbg.attach).toHaveBeenCalledWith('1.3')
+
+      // Guest destroyed: its 'destroyed' handler drops it from the self-attach set.
+      guest.__handlers.destroyed?.()
+      stop()
+      expect(guestDbg.detach).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ── event re-injection + single subscription ───────────────────────────────────
+
+describe('installElementsForward — event re-injection', () => {
+  it('re-injects render-domain guest EVENTS into the front-end, ignores others', async () => {
+    vi.useFakeTimers()
+    try {
+      const guestDbg = fakeDebugger({ attached: true })
+      const guest = fakeWc({ debugger: guestDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 1, method: 'DOM.enable', params: {}, sessionId: null },
+      ])
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      guestDbg.__emit('DOM.setChildNodes', { parentId: 1, nodes: [] })
+      guestDbg.__emit('Runtime.consoleAPICalled', { type: 'log' })
+      await vi.advanceTimersByTimeAsync(10)
+
+      const dispatched = (devtoolsWc.executeJavaScript as ReturnType<typeof vi.fn>).mock.calls
+        .map((c) => c[0] as string)
+        .filter((s) => s.includes('dispatchMessage'))
+      expect(dispatched.some((s) => s.includes('DOM.setChildNodes'))).toBe(true)
+      expect(dispatched.some((s) => s.includes('Runtime.consoleAPICalled'))).toBe(false)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('only wires a guest message listener once across repeated commands', async () => {
+    vi.useFakeTimers()
+    try {
+      const guestDbg = fakeDebugger({ attached: true })
+      const guest = fakeWc({ debugger: guestDbg })
+      let calls = 0
+      const devtoolsWc = fakeWc({
+        executeJavaScript: vi.fn((src: string) => {
+          if (isReconcile(src)) {
+            calls++
+            const batch = calls === 1
+              ? [{ id: 1, method: 'DOM.getDocument', params: {}, sessionId: null }]
+              : calls === 2
+                ? [{ id: 2, method: 'DOM.getDocument', params: {}, sessionId: null }]
+                : []
+            return Promise.resolve({ status: calls === 1 ? 'installed' : 'already', batch })
+          }
+          return Promise.resolve(true)
+        }),
+      })
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(600)
+
+      const messageSubscriptions = (guestDbg.on as ReturnType<typeof vi.fn>).mock.calls
+        .filter((c) => c[0] === 'message')
+      expect(messageSubscriptions.length).toBe(1)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ── degradation ────────────────────────────────────────────────────────────────
+
+describe('installElementsForward — degradation', () => {
+  it('does not throw and stays inert when the front-end hook never installs', async () => {
+    vi.useFakeTimers()
+    try {
+      const guest = fakeWc()
+      const bridge = fakeBridge(() => guest)
+      // Front-end never has the embedder global → reconcile reports 'partial'
+      // forever (hook never wraps), and the outbound queue is always empty.
+      const devtoolsWc = fakeWc({
+        executeJavaScript: vi.fn((src: string) =>
+          isReconcile(src) ? Promise.resolve({ status: 'partial', batch: [] }) : Promise.resolve(true)),
+      })
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+      // Run well past the install-poll budget; nothing should throw.
+      await vi.advanceTimersByTimeAsync(5000)
+      // No render command was ever routed at the guest (hook never armed).
+      expect((guest.debugger.sendCommand as ReturnType<typeof vi.fn>).mock.calls.length).toBe(0)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('survives an executeJavaScript that rejects (booting / torn-down front-end)', async () => {
+    vi.useFakeTimers()
+    try {
+      const guest = fakeWc()
+      const bridge = fakeBridge(() => guest)
+      const devtoolsWc = fakeWc({
+        executeJavaScript: vi.fn(() => Promise.reject(new Error('Script failed to execute'))),
+      })
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+      await vi.advanceTimersByTimeAsync(1000)
+      // No throw; disposer is callable.
+      expect(() => stop()).not.toThrow()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ── disposer ─────────────────────────────────────────────────────────────────────
+
+describe('installElementsForward — disposer', () => {
+  it('stops timers (no further executeJavaScript) and unsubscribes render events', async () => {
+    vi.useFakeTimers()
+    try {
+      const guest = fakeWc()
+      const bridge = fakeBridge(() => guest)
+      const devtoolsWc = fakeWc()
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+      await vi.advanceTimersByTimeAsync(200)
+      const before = (devtoolsWc.executeJavaScript as ReturnType<typeof vi.fn>).mock.calls.length
+      expect(before).toBeGreaterThan(0)
+      stop()
+      await vi.advanceTimersByTimeAsync(1000)
+      expect((devtoolsWc.executeJavaScript as ReturnType<typeof vi.fn>).mock.calls.length).toBe(before)
+      // render-event subscription removed → emitting does nothing.
+      bridge.__emit({ kind: 'activePage', appId: 'a', bridgeId: 'b' })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ── continuous re-assertion (the reconcile loop re-installs the hook) ───────────
+
+// Count reconcile ticks that (re)assert the front-end hook. Every reconcile
+// script (buildReconcileScript) embeds the `__diminaElementsHookInstalled`
+// sentinel; dispatch calls reference `dispatchMessage` instead. So filtering on
+// the sentinel isolates the reconcile ticks.
+function hookInstallCount(devtoolsWc: ReturnType<typeof fakeWc>): number {
+  return (devtoolsWc.executeJavaScript as ReturnType<typeof vi.fn>).mock.calls
+    .filter((c) => (c[0] as string).includes('__diminaElementsHookInstalled')).length
+}
+
+describe('installElementsForward — continuous re-assertion', () => {
+  // The hook lives in the front-end's `globalThis`; a front-end reload (notably a
+  // service-host pool swap that re-opens DevTools on a hot-reload respawn) wipes
+  // it. The reconcile loop re-asserts the hook EVERY tick — not once, and not
+  // gated on a single `dom-ready` event — so a reloaded front-end is re-hooked on
+  // the next tick. This pins that the loop keeps issuing install calls over time
+  // (a single-shot install would stop after the first success).
+  it('keeps re-asserting the hook every tick (not single-shot)', async () => {
+    vi.useFakeTimers()
+    try {
+      const guest = fakeWc()
+      const devtoolsWc = devtoolsWcDrainingOnce([])
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      // First ticks install the hook.
+      await vi.advanceTimersByTimeAsync(400)
+      const afterFirst = hookInstallCount(devtoolsWc)
+      expect(afterFirst).toBeGreaterThan(0)
+
+      // No further events — just more ticks. A single-shot install would freeze
+      // here; the reconcile loop keeps re-asserting, so a future reload is covered.
+      await vi.advanceTimersByTimeAsync(400)
+
+      expect(hookInstallCount(devtoolsWc)).toBeGreaterThan(afterFirst)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // After dispose the `dom-ready` listener is removed (and the `disposed` guard
+  // short-circuits `onReady`), so a stray reload must NOT re-install the hook.
+  it('does not re-install after dispose (dom-ready listener removed)', async () => {
+    vi.useFakeTimers()
+    try {
+      const guest = fakeWc()
+      const devtoolsWc = devtoolsWcDrainingOnce([])
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+      expect(hookInstallCount(devtoolsWc)).toBeGreaterThan(0)
+
+      stop()
+      const afterStop = hookInstallCount(devtoolsWc)
+
+      // Reload after dispose → no new install call.
+      devtoolsWc.__handlers['dom-ready']!()
+      await vi.advanceTimersByTimeAsync(400)
+      expect(hookInstallCount(devtoolsWc)).toBe(afterStop)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // Re-arm must clear the prior load's timers before starting fresh ones, and
+  // dispose must stop them all. After a re-arm + dispose, advancing time must NOT
+  // drive any further executeJavaScript (no leaked install/drain interval).
+  it('leaks no timers across re-arm + dispose', async () => {
+    vi.useFakeTimers()
+    try {
+      const guest = fakeWc()
+      const devtoolsWc = devtoolsWcDrainingOnce([])
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+      devtoolsWc.__handlers['dom-ready']!() // re-arm a fresh load
+      await vi.advanceTimersByTimeAsync(400)
+
+      stop()
+      const frozen = (devtoolsWc.executeJavaScript as ReturnType<typeof vi.fn>).mock.calls.length
+      await vi.advanceTimersByTimeAsync(2000)
+      expect((devtoolsWc.executeJavaScript as ReturnType<typeof vi.fn>).mock.calls.length).toBe(frozen)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ── connection-registry-routed teardown ─────────────────────────────────────────
+
+describe('installElementsForward — connection-routed teardown', () => {
+  // When a `connections` registry is supplied, the per-guest `onDestroyed`
+  // teardown is routed through `connections.acquire(wc).on('closed', cleanup)`
+  // (the wc-lifetime hook) — NOT through `own()`, and NOT via a bespoke
+  // `wc.once('destroyed')`. This MUST stay `on('closed')` and must NOT be changed
+  // to `own()`: `own()`'s release handle FIRES the cleanup on dispose, which would
+  // mutate `wiredGuests` mid-drain; render guests are NEVER pool-reset, so
+  // `'closed'` (fires only on real wc destroy, and whose dispose() removes the
+  // listener WITHOUT firing) is the correct lifetime hook here.
+  // The observable contract is identical to the existing fallback path: a
+  // self-attached guest that is destroyed is dropped from the self-attach set, so
+  // a later stop() does NOT try to detach its (already-gone) session. If the
+  // teardown were never wired through the connection, the guest would stay in
+  // selfAttached and stop() would call detach() on it.
+  it('routes guest onDestroyed through the connection registry (drops self-attach on destroy)', async () => {
+    vi.useFakeTimers()
+    try {
+      const guestDbg = fakeDebugger({ attached: false }) // forces a self-attach
+      const guest = emitterWc({ debugger: guestDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 1, method: 'DOM.getDocument', params: {}, sessionId: null },
+      ])
+      const bridge = fakeBridge(() => guest)
+      const connections = createConnectionRegistry()
+
+      const stop = installElementsForward({
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        devtoolsWc: devtoolsWc as any,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        bridge: bridge as any,
+        connections,
+      })
+
+      await vi.advanceTimersByTimeAsync(400)
+      // We self-attached the guest's debugger (it started detached).
+      expect(guestDbg.attach).toHaveBeenCalledWith('1.3')
+      // The teardown was registered against the guest's connection, not as a raw
+      // 'destroyed' listener consumed by the feature directly.
+      expect(connections.get(guest.id)).toBeDefined()
+
+      // Destroy the guest → the connection registry disposes the owned cleanup
+      // (onDestroyed), which removes it from selfAttached.
+      guest.__destroy()
+      await vi.advanceTimersByTimeAsync(5)
+
+      stop()
+      // Connection-routed onDestroyed already dropped this wc from selfAttached,
+      // so stop() must NOT detach the (now destroyed) session.
+      expect(guestDbg.detach).not.toHaveBeenCalled()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ── guest priming (enable-domain ordering) ──────────────────────────────────────
+
+// Names of the priming enable commands as they reach the guest debugger.
+function enableSendOrder(guestDbg: ReturnType<typeof fakeDebugger>): string[] {
+  return (guestDbg.sendCommand as ReturnType<typeof vi.fn>).mock.calls
+    .map((c) => c[0] as string)
+    .filter((m) => m === 'DOM.enable' || m === 'CSS.enable' || m === 'Overlay.enable')
+}
+
+describe('installElementsForward — guest priming ordering', () => {
+  // Chromium rejects `Overlay.enable` with -32000 "DOM should be enabled first"
+  // when it arrives before `DOM.enable` has completed. Priming MUST therefore let
+  // `DOM.enable` settle before sending `Overlay.enable`, not fire them
+  // concurrently. With a deferred `DOM.enable`, `Overlay.enable` must not appear
+  // on the guest until that deferral resolves.
+  it('does not send Overlay.enable to the guest until DOM.enable has resolved', async () => {
+    vi.useFakeTimers()
+    try {
+      let resolveDomEnable!: (v: unknown) => void
+      const guestDbg = fakeDebugger({
+        attached: true,
+        sendCommand: vi.fn((method: string) => {
+          if (method === 'DOM.enable') {
+            return new Promise((res) => { resolveDomEnable = res })
+          }
+          return Promise.resolve({})
+        }),
+      })
+      const guest = fakeWc({ debugger: guestDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([])
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      // Priming runs as the guest is wired. DOM.enable is in flight (deferred).
+      await vi.advanceTimersByTimeAsync(400)
+      expect(enableSendOrder(guestDbg)).toContain('DOM.enable')
+      // Overlay.enable must NOT have been sent while DOM.enable is still pending.
+      expect(enableSendOrder(guestDbg)).not.toContain('Overlay.enable')
+
+      // DOM.enable completes → Overlay.enable is now allowed to go out.
+      resolveDomEnable({})
+      await vi.advanceTimersByTimeAsync(50)
+
+      const order = enableSendOrder(guestDbg)
+      expect(order).toContain('Overlay.enable')
+      // DOM.enable precedes Overlay.enable in the send order.
+      expect(order.indexOf('DOM.enable')).toBeLessThan(order.indexOf('Overlay.enable'))
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // The priming sequence is anchored to the guest it began on. If the active
+  // render guest switches mid-enable (a page swap between DOM.enable being sent
+  // and resolving), the now-stale original guest must NOT receive Overlay.enable:
+  // its DOM tree is no longer what the front-end is looking at, and re-enabling
+  // its Overlay would paint into an abandoned tree.
+  it('does not send Overlay.enable to the original guest if the active guest switched before DOM.enable resolved', async () => {
+    vi.useFakeTimers()
+    try {
+      let resolveDomEnable!: (v: unknown) => void
+      // Guest A: DOM.enable is deferred so we can flip the active guest mid-enable.
+      const aDbg = fakeDebugger({
+        attached: true,
+        sendCommand: vi.fn((method: string) => {
+          if (method === 'DOM.enable') {
+            return new Promise((res) => { resolveDomEnable = res })
+          }
+          return Promise.resolve({})
+        }),
+      })
+      const guestA = fakeWc({ debugger: aDbg })
+      const bDbg = fakeDebugger({ attached: true })
+      const guestB = fakeWc({ debugger: bDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([])
+      const bridge = fakeSwitchableBridge(guestA)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      // Priming begins on A. DOM.enable is sent and left pending.
+      await vi.advanceTimersByTimeAsync(400)
+      expect(enableSendOrder(aDbg)).toContain('DOM.enable')
+      expect(enableSendOrder(aDbg)).not.toContain('Overlay.enable')
+
+      // Active render guest switches A → B before DOM.enable resolves.
+      bridge.setActive(guestB)
+      bridge.__emit({ kind: 'activePage', appId: 'a', bridgeId: 'b' })
+      await vi.advanceTimersByTimeAsync(5)
+
+      // A's DOM.enable finally resolves — but A is no longer the active guest.
+      resolveDomEnable({})
+      await vi.advanceTimersByTimeAsync(50)
+
+      // The stale guest A must NEVER get Overlay.enable after the switch.
+      expect(enableSendOrder(aDbg)).not.toContain('Overlay.enable')
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // All three Elements-tree domains are ultimately enabled on the guest so the
+  // panel can read the DOM/CSS and paint the inspect overlay.
+  it('enables DOM, CSS, and Overlay on the primed guest', async () => {
+    vi.useFakeTimers()
+    try {
+      const guestDbg = fakeDebugger({ attached: true })
+      const guest = fakeWc({ debugger: guestDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([])
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      const order = enableSendOrder(guestDbg)
+      expect(order).toContain('DOM.enable')
+      expect(order).toContain('CSS.enable')
+      expect(order).toContain('Overlay.enable')
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  // Priming is best-effort: a failing enable (here DOM.enable rejects, the exact
+  // failure mode Chromium reports for an out-of-order enable) must not surface as
+  // a thrown error or a rejected priming, and the disposer must stay callable.
+  it('does not throw when a priming enable rejects', async () => {
+    vi.useFakeTimers()
+    try {
+      const guestDbg = fakeDebugger({
+        attached: true,
+        sendCommand: vi.fn((method: string) =>
+          method === 'DOM.enable'
+            ? Promise.reject(new Error('DOM should be enabled first'))
+            : Promise.resolve({})),
+      })
+      const guest = fakeWc({ debugger: guestDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([])
+      const bridge = fakeBridge(() => guest)
+
+      let stop!: () => void
+      expect(() => {
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+      }).not.toThrow()
+
+      // Let the priming sequence run to completion past the rejection.
+      await vi.advanceTimersByTimeAsync(400)
+      expect(enableSendOrder(guestDbg)).toContain('DOM.enable')
+      expect(() => stop()).not.toThrow()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ── Overlay.disable guard (highlight survives Elements-panel state transitions) ──
+
+describe('installElementsForward — Overlay.disable guard', () => {
+  // Chrome's Elements front-end emits `Overlay.disable` on some panel state
+  // transitions. Forwarding it verbatim returns the guest's Overlay to the
+  // non-painting state, after which `Overlay.highlightNode` fails until Overlay is
+  // re-enabled. The feature must NOT leave the guest's Overlay disabled: either it
+  // never forwards `Overlay.disable` to the guest at all, or it re-enables Overlay
+  // (sends `Overlay.enable`) at or after the disable. Either strategy satisfies
+  // the requirement; this pins the net effect, not the mechanism.
+  it('does not leave the guest Overlay disabled after a forwarded Overlay.disable', async () => {
+    vi.useFakeTimers()
+    try {
+      const guestDbg = fakeDebugger({ attached: true })
+      const guest = fakeWc({ debugger: guestDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 21, method: 'Overlay.disable', params: {}, sessionId: null },
+      ])
+      const bridge = fakeBridge(() => guest)
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      const stop = installElementsForward({ devtoolsWc: devtoolsWc as any, bridge: bridge as any })
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      const sent = (guestDbg.sendCommand as ReturnType<typeof vi.fn>).mock.calls
+        .map((c) => c[0] as string)
+      const disableIdx = sent.indexOf('Overlay.disable')
+
+      if (disableIdx === -1) {
+        // Strategy (i): Overlay.disable is swallowed and never reaches the guest.
+        expect(sent).not.toContain('Overlay.disable')
+      } else {
+        // Strategy (ii): Overlay.disable is forwarded, but Overlay is re-enabled
+        // at or after it, so the guest is not left in the disabled state.
+        const reEnableIdx = sent.indexOf('Overlay.enable', disableIdx)
+        expect(reEnableIdx).toBeGreaterThanOrEqual(disableIdx)
+      }
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ── reconcile tick vs a loading front-end ───────────────────────────────────────
+
+describe('reconcile tick while the devtools front-end is loading', () => {
+  it('skips the inject while the MAIN frame is loading even when the coarse isLoading reads false', async () => {
+    vi.useFakeTimers()
+    try {
+      const guest = fakeWc()
+      // Electron's internal executeJavaScript gate is isLoadingMainFrame, not
+      // isLoading — during their divergence window every tick would queue one
+      // did-stop-loading waiter despite isLoading()===false.
+      const devtoolsWc = fakeWc({
+        isLoading: vi.fn(() => false),
+        isLoadingMainFrame: vi.fn(() => true),
+      })
+      const bridge = fakeBridge(() => guest)
+      const stop = installElementsForward(
+        { devtoolsWc, bridge } as unknown as Parameters<typeof installElementsForward>[0],
+      )
+      const execSpy = devtoolsWc.executeJavaScript as ReturnType<typeof vi.fn>
+      const callsAtInstall = execSpy.mock.calls.length
+      await vi.advanceTimersByTimeAsync(1500)
+      expect(execSpy.mock.calls.length).toBe(callsAtInstall)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('drops the activePage-driven documentUpdated push while the front-end is unsettled', async () => {
+    vi.useFakeTimers()
+    try {
+      const guest = fakeWc()
+      const devtoolsWc = fakeWc({
+        isLoading: vi.fn(() => false),
+        isLoadingMainFrame: vi.fn(() => true),
+      })
+      const bridge = fakeBridge(() => guest)
+      const stop = installElementsForward(
+        { devtoolsWc, bridge } as unknown as Parameters<typeof installElementsForward>[0],
+      )
+      const execSpy = devtoolsWc.executeJavaScript as ReturnType<typeof vi.fn>
+      const callsAtInstall = execSpy.mock.calls.length
+      // An activePage burst during churn drives primeGuest + pushDocumentUpdated;
+      // each push against an unsettled front-end would queue one internal waiter.
+      for (let i = 0; i < 10; i++) bridge.__emit({ kind: 'activePage', bridgeId: `b${i}` })
+      await vi.advanceTimersByTimeAsync(50)
+      expect(execSpy.mock.calls.length).toBe(callsAtInstall)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('skips the inject per tick while loading, resumes on the first post-load tick', async () => {
+    vi.useFakeTimers()
+    try {
+      const guest = fakeWc()
+      // A front-end mid-(re)load: executeJavaScript would queue one
+      // did-stop-loading waiter PER 150ms TICK on the wc emitter until the
+      // load ends — the reconcile loop must not inject while isLoading().
+      const devtoolsWc = fakeWc({ isLoading: vi.fn(() => true) })
+      const bridge = fakeBridge(() => guest)
+      const stop = installElementsForward(
+        { devtoolsWc, bridge } as unknown as Parameters<typeof installElementsForward>[0],
+      )
+      const execSpy = devtoolsWc.executeJavaScript as ReturnType<typeof vi.fn>
+      const callsAtInstall = execSpy.mock.calls.length
+
+      await vi.advanceTimersByTimeAsync(1500)
+      expect(execSpy.mock.calls.length).toBe(callsAtInstall)
+
+      ;(devtoolsWc.isLoading as ReturnType<typeof vi.fn>).mockReturnValue(false)
+      await vi.advanceTimersByTimeAsync(400)
+      expect(execSpy.mock.calls.length).toBeGreaterThan(callsAtInstall)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
+
+// ── network body route (fixes "Failed to load response data" in the panel) ──
+//
+// The front-end's Network.getResponseBody / Network.getRequestPostData calls
+// for a request the panel learned about through network-forward carry a
+// virtual (dimina:sim:-prefixed) requestId that no attached backend
+// recognizes. routeOutboundCommand is the pure classifier that picks these
+// two methods+virtual-id combinations out as 'network' (vs. the existing
+// 'render'/'service' split); the hook script embeds the same classification
+// client-side so the queued item already carries its route, and the drain
+// loop answers 'network' items from the NetworkBodyProvider instead of
+// routing them at the render guest debugger.
+
+describe('routeOutboundCommand (pure)', () => {
+  it('routes the render-tree domains to "render"', () => {
+    for (const method of [
+      'DOM.getDocument',
+      'CSS.getMatchedStylesForNode',
+      'Overlay.highlightNode',
+      'DOMSnapshot.captureSnapshot',
+      'DOMDebugger.getEventListeners',
+    ]) {
+      expect(routeOutboundCommand(method, {})).toBe('render')
+    }
+  })
+
+  it('routes Network.getResponseBody / getRequestPostData with a virtual (dimina:sim:) requestId to "network"', () => {
+    expect(routeOutboundCommand('Network.getResponseBody', { requestId: 'dimina:sim:E1:1:r1' })).toBe('network')
+    expect(routeOutboundCommand('Network.getRequestPostData', { requestId: 'dimina:sim:E1:1:r1' })).toBe('network')
+  })
+
+  it('routes the same two Network methods to "service" when the requestId is NOT a virtual id', () => {
+    // A real backend can answer these for its own (non-simulator) requestIds;
+    // only the dimina:sim: namespace is ours to intercept.
+    expect(routeOutboundCommand('Network.getResponseBody', { requestId: 'raw-id' })).toBe('service')
+    expect(routeOutboundCommand('Network.getRequestPostData', { requestId: 'raw-id' })).toBe('service')
+  })
+
+  it('routes to "service" when params are malformed (missing/non-string requestId)', () => {
+    expect(routeOutboundCommand('Network.getResponseBody', {})).toBe('service')
+    expect(routeOutboundCommand('Network.getResponseBody', { requestId: 42 })).toBe('service')
+    expect(routeOutboundCommand('Network.getResponseBody', null)).toBe('service')
+  })
+
+  it('routes every other CDP method to "service"', () => {
+    for (const method of ['Runtime.evaluate', 'Page.navigate', 'Emulation.setDeviceMetricsOverride', 'Network.enable']) {
+      expect(routeOutboundCommand(method, {})).toBe('service')
+    }
+  })
+})
+
+describe('buildElementsHookScript — network route interception', () => {
+  // Chrome DevTools' embedder API is `InspectorFrontendHost.sendMessageToBackend(message: string)`
+  // where `message` is the JSON-encoded CDP command. The hook wraps it; we
+  // expose the fake host under both resolution paths real bundled DevTools
+  // builds use (flat global and Host-namespaced) so the test is agnostic to
+  // which one the injected script reads.
+  function installHookOn(win: typeof window): { sendMessageToBackend: ReturnType<typeof vi.fn> } {
+    const sendMessageToBackend = vi.fn()
+    const fakeHost = { sendMessageToBackend }
+    ;(win as unknown as { InspectorFrontendHost?: unknown }).InspectorFrontendHost = fakeHost
+    ;(win as unknown as { Host?: unknown }).Host = { InspectorFrontendHost: fakeHost }
+    win.eval(buildElementsHookScript())
+    return { sendMessageToBackend }
+  }
+
+  function sendToHook(win: typeof window, message: string): void {
+    const host = (win as unknown as { InspectorFrontendHost: { sendMessageToBackend: (m: string) => void } })
+      .InspectorFrontendHost
+    host.sendMessageToBackend(message)
+  }
+
+  function outboundQueue(win: typeof window): Array<{ id: number; method: string; params: unknown; route?: string }> {
+    return (win as unknown as { __diminaElementsOutbound?: unknown[] }).__diminaElementsOutbound as never ?? []
+  }
+
+  afterEach(() => {
+    delete (window as unknown as { InspectorFrontendHost?: unknown }).InspectorFrontendHost
+    delete (window as unknown as { Host?: unknown }).Host
+    delete (window as unknown as { __diminaElementsOutbound?: unknown }).__diminaElementsOutbound
+    delete (window as unknown as { __diminaElementsHookInstalled?: unknown }).__diminaElementsHookInstalled
+  })
+
+  it('queues a Network.getResponseBody call for a virtual requestId under route "network", without forwarding it to the real backend', () => {
+    const { sendMessageToBackend } = installHookOn(window)
+
+    sendToHook(window, JSON.stringify({
+      id: 5, method: 'Network.getResponseBody', params: { requestId: 'dimina:sim:E1:1:r1' }, sessionId: null,
+    }))
+
+    expect(sendMessageToBackend).not.toHaveBeenCalled()
+    const queued = outboundQueue(window)
+    expect(queued.find((m) => m.id === 5)).toMatchObject({
+      method: 'Network.getResponseBody',
+      params: { requestId: 'dimina:sim:E1:1:r1' },
+      route: 'network',
+    })
+  })
+
+  it('passes a Network.getResponseBody call through unmodified when the requestId is not a virtual dimina:sim: id', () => {
+    const { sendMessageToBackend } = installHookOn(window)
+    const raw = JSON.stringify({
+      id: 6, method: 'Network.getResponseBody', params: { requestId: 'raw-non-virtual' }, sessionId: null,
+    })
+
+    sendToHook(window, raw)
+
+    expect(sendMessageToBackend).toHaveBeenCalledWith(raw)
+    expect(outboundQueue(window).find((m) => m.id === 6)).toBeUndefined()
+  })
+
+  it('still queues a render-domain command under route "render" (network interception does not disturb it)', () => {
+    installHookOn(window)
+
+    sendToHook(window, JSON.stringify({ id: 7, method: 'DOM.getDocument', params: {}, sessionId: null }))
+
+    expect(outboundQueue(window).find((m) => m.id === 7)).toMatchObject({ method: 'DOM.getDocument', route: 'render' })
+  })
+
+  // Equivalence corpus: the hook script inlines a hand-written JS mirror of
+  // `routeOutboundCommand` (same literals, separate code) so it can classify a
+  // command client-side without a round-trip to main. The three hand-picked
+  // cases above only sample that mirror; this sweep is driven directly by the
+  // exported `RENDER_DOMAIN_PREFIXES` / `NETWORK_BODY_METHODS` constants (the
+  // single source both the TS function and the injected script read from), so
+  // it automatically covers any future addition to either list and fails the
+  // moment the script's `routeOf()` diverges from `routeOutboundCommand()` for
+  // any case it produces.
+  it('matches routeOutboundCommand for every method the exported routing constants can produce', () => {
+    const { sendMessageToBackend } = installHookOn(window)
+
+    const renderMethodSamples = RENDER_DOMAIN_PREFIXES.flatMap((prefix) => [
+      `${prefix}enable`,
+      `${prefix}someOtherMethod`,
+    ])
+    const serviceControlMethods = [
+      'Runtime.evaluate',
+      'Page.navigate',
+      'Emulation.setDeviceMetricsOverride',
+      'Emulation.setSafeAreaInsetsOverride',
+      'Console.enable',
+      'Debugger.enable',
+      'Target.attachToTarget',
+      'Input.dispatchKeyEvent',
+      'Profiler.start',
+      'Log.enable',
+      // Network.* methods OTHER than the two body methods must stay on service.
+      'Network.enable',
+      'Network.requestWillBeSent',
+    ]
+    const requestIdVariants: Array<{ requestId?: string }> = [
+      { requestId: `${VIRTUAL_REQUEST_ID_PREFIX}E1:1:r1` },
+      { requestId: 'raw-id-not-virtual' },
+      {},
+    ]
+
+    let nextId = 10_000
+    const cases: Array<{ id: number; method: string; params: Record<string, unknown>; expected: ReturnType<typeof routeOutboundCommand> }> = []
+    for (const method of renderMethodSamples) {
+      cases.push({ id: nextId++, method, params: {}, expected: routeOutboundCommand(method, {}) })
+    }
+    for (const method of serviceControlMethods) {
+      cases.push({ id: nextId++, method, params: {}, expected: routeOutboundCommand(method, {}) })
+    }
+    for (const method of NETWORK_BODY_METHODS) {
+      for (const variant of requestIdVariants) {
+        const params = variant.requestId === undefined ? {} : { requestId: variant.requestId }
+        cases.push({ id: nextId++, method, params, expected: routeOutboundCommand(method, params) })
+      }
+    }
+
+    // Sanity: the corpus must actually exercise all three routes, or this test
+    // would pass trivially without ever checking the render/network arms.
+    expect(new Set(cases.map((c) => c.expected))).toEqual(new Set(['render', 'network', 'service']))
+
+    for (const c of cases) {
+      const raw = JSON.stringify({ id: c.id, method: c.method, params: c.params, sessionId: null })
+      sendToHook(window, raw)
+
+      const queuedEntry = outboundQueue(window).find((m) => m.id === c.id)
+      if (c.expected === 'service') {
+        expect(sendMessageToBackend.mock.calls.some((call) => call[0] === raw)).toBe(true)
+        expect(queuedEntry).toBeUndefined()
+      } else {
+        expect(queuedEntry).toMatchObject({ method: c.method, route: c.expected })
+      }
+    }
+  })
+})
+
+describe('installElementsForward — network body route (main process drain)', () => {
+  it('drains a route: "network" getResponseBody command through deps.network and dispatches the resolved result', async () => {
+    vi.useFakeTimers()
+    try {
+      const guest = fakeWc()
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 30, method: 'Network.getResponseBody', params: { requestId: 'dimina:sim:E1:1:r1' }, sessionId: null, route: 'network' },
+      ])
+      const bridge = fakeBridge(() => guest)
+      const network = {
+        getResponseBody: vi.fn(() => Promise.resolve({ body: 'hi', base64Encoded: false })),
+        getRequestPostData: vi.fn(() => Promise.resolve({ postData: '' })),
+      }
+      const stop = installElementsForward(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { devtoolsWc: devtoolsWc as any, bridge: bridge as any, network },
+      )
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      expect(network.getResponseBody).toHaveBeenCalledWith('dimina:sim:E1:1:r1')
+      const dispatched = dispatchedMatching(devtoolsWc, '\\"id\\":30')
+      expect(dispatched.length).toBeGreaterThan(0)
+      expect(dispatched.some((s) => s.includes('result'))).toBe(true)
+      expect(dispatched.some((s) => s.includes('\\"body\\":\\"hi\\"'))).toBe(true)
+      // Never routed at the render guest — it answers from the provider only.
+      expect((guest.debugger.sendCommand as ReturnType<typeof vi.fn>).mock.calls
+        .some((c) => c[0] === 'Network.getResponseBody')).toBe(false)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('drains a route: "network" command that rejects and dispatches a -32000 CDP error with the rejection message', async () => {
+    vi.useFakeTimers()
+    try {
+      const guest = fakeWc()
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 31, method: 'Network.getRequestPostData', params: { requestId: 'dimina:sim:E1:1:r9' }, sessionId: null, route: 'network' },
+      ])
+      const bridge = fakeBridge(() => guest)
+      const network = {
+        getResponseBody: vi.fn(() => Promise.resolve({ body: '', base64Encoded: false })),
+        getRequestPostData: vi.fn(() => Promise.reject(new Error('No resource with given identifier found'))),
+      }
+      const stop = installElementsForward(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { devtoolsWc: devtoolsWc as any, bridge: bridge as any, network },
+      )
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      const dispatched = dispatchedMatching(devtoolsWc, '\\"id\\":31')
+      expect(dispatched.some((s) => s.includes('No resource with given identifier found') && s.includes('-32000'))).toBe(true)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('replies with a not-found CDP error for a route: "network" command when no network provider is wired', async () => {
+    vi.useFakeTimers()
+    try {
+      const guest = fakeWc()
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 32, method: 'Network.getResponseBody', params: { requestId: 'dimina:sim:E1:1:r1' }, sessionId: null, route: 'network' },
+      ])
+      const bridge = fakeBridge(() => guest)
+      const stop = installElementsForward(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { devtoolsWc: devtoolsWc as any, bridge: bridge as any }, // no `network` deps supplied
+      )
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      const dispatched = dispatchedMatching(devtoolsWc, '\\"id\\":32')
+      expect(dispatched.some((s) => s.includes('No resource with given identifier found') && s.includes('-32000'))).toBe(true)
+      expect((guest.debugger.sendCommand as ReturnType<typeof vi.fn>).mock.calls
+        .some((c) => c[0] === 'Network.getResponseBody')).toBe(false)
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('treats a drained item with no route field as "render" (back-compat with pre-network hook payloads)', async () => {
+    vi.useFakeTimers()
+    try {
+      const guestDbg = fakeDebugger({
+        sendCommand: vi.fn((method: string) =>
+          method === 'DOM.getDocument' ? Promise.resolve({ root: { nodeId: 1 } }) : Promise.resolve({})),
+      })
+      const guest = fakeWc({ debugger: guestDbg })
+      const devtoolsWc = devtoolsWcDrainingOnce([
+        { id: 33, method: 'DOM.getDocument', params: {}, sessionId: null }, // no `route`
+      ])
+      const bridge = fakeBridge(() => guest)
+      const stop = installElementsForward(
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        { devtoolsWc: devtoolsWc as any, bridge: bridge as any },
+      )
+
+      await vi.advanceTimersByTimeAsync(400)
+
+      expect(guestDbg.sendCommand).toHaveBeenCalledWith('DOM.getDocument', {})
+      stop()
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+})
