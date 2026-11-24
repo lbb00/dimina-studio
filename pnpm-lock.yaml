@@ -119,8 +119,8 @@ importers:
   .:
     devDependencies:
       '@pawl-tools/cli':
-        specifier: 0.8.1
-        version: 0.8.1
+        specifier: 0.9.0
+        version: 0.9.0
       eslint:
         specifier: ^10.2.1
         version: 10.12.0(jiti@2.7.0)(supports-color@8.1.1)
@@ -1854,38 +1854,38 @@ packages:
     resolution: {integrity: sha512-7FNeNl8NCE7aINx7WXiKQrPYZWC/hvrTsmk6zmxbI7LTXE7hVek/n8AfVgpe2y82zl3w0HvCHN0bVKMBoJcC0w==}
     engines: {node: '>= 10.0.0'}
 
-  '@pawl-tools/cli-darwin-arm64@0.8.1':
-    resolution: {integrity: sha512-H8pixfNdrOaaOAMzgA2ipVV1hppJ9aPhkUi+X0+2UI8HQWog9nL9+VbwPDssuBp/h65mLhU2ZuWAJy8fRyI/jg==}
+  '@pawl-tools/cli-darwin-arm64@0.9.0':
+    resolution: {integrity: sha512-2VBc/5bRC1PGCkx+CQlp75Je5Omxfh63IdOp3Lx03Osa0TkhlYgw/Qm4kltdcrAPV5/6hh1tzClabECdFh0mNQ==}
     cpu: [arm64]
     os: [darwin]
 
-  '@pawl-tools/cli-darwin-x64@0.8.1':
-    resolution: {integrity: sha512-6OJi7/0uBu0nwCmfX0h34LUbtWJ6onf/LLIxc+Xfm1G5OPt5vIAb/1iD2t6TbGWGrYxrW9C2eATosWEwLCQQug==}
+  '@pawl-tools/cli-darwin-x64@0.9.0':
+    resolution: {integrity: sha512-6hgEGjCvOMjGVHtR9GW+GgveltZqm+F+elQj01NNW0XZMmUmxnv/1CZj92A1O1z8yS7V2f1ZFzTjuqzsOT9Gfw==}
     cpu: [x64]
     os: [darwin]
 
-  '@pawl-tools/cli-linux-arm64@0.8.1':
-    resolution: {integrity: sha512-ATjmqblDh5uwSGXDiBAhAMMjS0wri2wKKUartLfZ+ro1UJJanqDu+fdRyb1bitQMYH57DS4KoyPeU3L0KQ5k+A==}
+  '@pawl-tools/cli-linux-arm64@0.9.0':
+    resolution: {integrity: sha512-jP9IiionlQIDNQfUhzlNbmSeIOWSkCWecZOt6O8aTc9+NO88Bul4VyJWuS2xqghPLjiqgfl8l5p4wyuIQ+aOQg==}
     cpu: [arm64]
     os: [linux]
 
-  '@pawl-tools/cli-linux-x64@0.8.1':
-    resolution: {integrity: sha512-ZhwKtuNt9tHJMq/Z4ICCuUxxMlGpPYZkeYpe74W1jjn4UVAy9xAwDY6zmN/HDHXUZmLlbzfyvoPkfyE6kXi4Pw==}
+  '@pawl-tools/cli-linux-x64@0.9.0':
+    resolution: {integrity: sha512-NBXXeZltjYjk616bKGR2RKIhBXpBvr5KxxuA+H2GI3z+RgdlHl6DiA2Jqdm9gOZq07QzXW7ndAXOId9RC4qVQA==}
     cpu: [x64]
     os: [linux]
 
-  '@pawl-tools/cli-win32-arm64@0.8.1':
-    resolution: {integrity: sha512-uykpertIcpdYb08llKjMSu+jirFUu1y9BmlMyrYyV9dIPrErQ/ZZcPDLbfmp+O1qaBygWycCXnIpSJTaETQ0bg==}
+  '@pawl-tools/cli-win32-arm64@0.9.0':
+    resolution: {integrity: sha512-2VtiAr5lAta7ZNzAZxW7fJq3qPDU0CuoZti6aeOGeS42v8wajGLwB3YHWLYbs1bHAgbiHX8UxU6Jpc9YeV3W5w==}
     cpu: [arm64]
     os: [win32]
 
-  '@pawl-tools/cli-win32-x64@0.8.1':
-    resolution: {integrity: sha512-fdc0JSmcFI6BDg/aThKwGX3T+gQhjBkgozO6mkK9yu7a+zzNWxvuHdaP+mJvVAXMGLvl7Ty+Gkp+xGlK1vFjDQ==}
+  '@pawl-tools/cli-win32-x64@0.9.0':
+    resolution: {integrity: sha512-2PmujRWK4N46e0Xwo51S05zR7DwAWdNCym80tj82NAp/I5x+R482lzsyR4dfcrTxKrEVJ/HyDd4rVYN9BveEKQ==}
     cpu: [x64]
     os: [win32]
 
-  '@pawl-tools/cli@0.8.1':
-    resolution: {integrity: sha512-6hEO0cUk/8k4/K6NYxBMSSNgYJyDXsv7zK28/KdaOLofvHlLGtS+3tANM31Qrx6BmXArZW3BwD0hDAfd1d9e9w==}
+  '@pawl-tools/cli@0.9.0':
+    resolution: {integrity: sha512-sJM/imBL3oq/GyggVRCK0v7NQ8JSGNxD+NMg6AX2Fd0Jdx/scNJPR62m2N3Y8/tqsewspvyrWgP9ugoBCBo3Zg==}
     engines: {node: '>=18'}
     hasBin: true
 
@@ -7459,32 +7459,32 @@ snapshots:
       '@parcel/watcher-win32-x64': 2.6.0
     optional: true
 
-  '@pawl-tools/cli-darwin-arm64@0.8.1':
+  '@pawl-tools/cli-darwin-arm64@0.9.0':
     optional: true
 
-  '@pawl-tools/cli-darwin-x64@0.8.1':
+  '@pawl-tools/cli-darwin-x64@0.9.0':
     optional: true
 
-  '@pawl-tools/cli-linux-arm64@0.8.1':
+  '@pawl-tools/cli-linux-arm64@0.9.0':
     optional: true
 
-  '@pawl-tools/cli-linux-x64@0.8.1':
+  '@pawl-tools/cli-linux-x64@0.9.0':
     optional: true
 
-  '@pawl-tools/cli-win32-arm64@0.8.1':
+  '@pawl-tools/cli-win32-arm64@0.9.0':
     optional: true
 
-  '@pawl-tools/cli-win32-x64@0.8.1':
+  '@pawl-tools/cli-win32-x64@0.9.0':
     optional: true
 
-  '@pawl-tools/cli@0.8.1':
+  '@pawl-tools/cli@0.9.0':
     optionalDependencies:
-      '@pawl-tools/cli-darwin-arm64': 0.8.1
-      '@pawl-tools/cli-darwin-x64': 0.8.1
-      '@pawl-tools/cli-linux-arm64': 0.8.1
-      '@pawl-tools/cli-linux-x64': 0.8.1
-      '@pawl-tools/cli-win32-arm64': 0.8.1
-      '@pawl-tools/cli-win32-x64': 0.8.1
+      '@pawl-tools/cli-darwin-arm64': 0.9.0
+      '@pawl-tools/cli-darwin-x64': 0.9.0
+      '@pawl-tools/cli-linux-arm64': 0.9.0
+      '@pawl-tools/cli-linux-x64': 0.9.0
+      '@pawl-tools/cli-win32-arm64': 0.9.0
+      '@pawl-tools/cli-win32-x64': 0.9.0
 
   '@playwright/test@1.64.0':
     dependencies:
